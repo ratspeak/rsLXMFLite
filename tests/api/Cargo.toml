@@ -1,0 +1,11 @@
+[package]
+name = "lxmf-lite-external-consumer"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+lxmf-lite-core = { path = "../.." }
+rns-lite-core = { path = "../../../rsReticulumLite" }

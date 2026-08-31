@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+exclude = ["tests/api"]
+
+[package]
+name = "lxmf-lite-core"
+description = "Bounded no_std LXMF message codec for MCU-class devices"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+rust-version = "1.87"
+publish = false
+repository = "https://github.com/ratspeak/rsLXMFLite"
+readme = "README.md"
+keywords = ["lxmf", "reticulum", "embedded", "no-std", "messaging"]
+categories = ["embedded", "network-programming", "no-std"]
+
+[lib]
+path = "src/lib.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+rns-lite-core = { path = "../rsReticulumLite", version = "0.1.0" }
+# Signature verification on inbound messages; same no_std pin as rns-lite-core.
+ed25519-dalek = { version = "2", default-features = false, features = ["fast", "zeroize"] }
+
+[dev-dependencies]
+# Trusted full-Rust cross-checks (host-only): byte-exact codec parity vs lxmf-core and
+# ECIES interop vs rns-identity. Never on the MCU build path.
+lxmf-core = { path = "../rsLXMF/crates/lxmf-core", version = "1.2.0" }
+rns-identity = { path = "../rsReticulum/crates/rns-identity", version = "1.2.0" }
+rns-crypto = { path = "../rsReticulum/crates/rns-crypto", version = "1.2.0" }
