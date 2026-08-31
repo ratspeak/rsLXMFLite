@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  LXMFLITE_RSRETICULUMLITE_COMMIT: ad17e4ce33174c73b6890856a6e205139ecc6f4e
+  LXMFLITE_RSRETICULUM_COMMIT: 3b3eb29c16c9dbc114c9b31d9f912a7b1a68652c
+  LXMFLITE_RSLXMF_COMMIT: e210e0c244c76532faae99696f83c94d44c27dc6
+
+jobs:
+  quality:
+    name: Full no_std matrix (Rust 1.87)
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          path: rsLXMFLite
+          fetch-depth: 0
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          repository: ${{ github.repository_owner }}/rsReticulumLite
+          ref: ${{ env.LXMFLITE_RSRETICULUMLITE_COMMIT }}
+          path: rsReticulumLite
+          token: ${{ secrets.PRIVATE_LITE_READ_TOKEN || github.token }}
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          repository: ${{ github.repository_owner }}/rsReticulum
+          ref: ${{ env.LXMFLITE_RSRETICULUM_COMMIT }}
+          path: rsReticulum
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          repository: ${{ github.repository_owner }}/rsLXMF
+          ref: ${{ env.LXMFLITE_RSLXMF_COMMIT }}
+          path: rsLXMF
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: 1.87.0
+          components: clippy, rustfmt
+          targets: thumbv7em-none-eabihf,riscv32imc-unknown-none-elf
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: rsLXMFLite -> target
+          cache-bin: false
+      - name: Run public core matrix
+        working-directory: rsLXMFLite
+        run: ./scripts/test-matrix.sh
+      - name: Enforce exact qualified sources
+        working-directory: rsLXMFLite
+        run: |
+          ./scripts/check-trusted-ref.sh --strict
+          ./scripts/check-rns-lite-ref.sh --strict
+
+  test:
+    name: Host tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          path: rsLXMFLite
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          repository: ${{ github.repository_owner }}/rsReticulumLite
+          ref: ${{ env.LXMFLITE_RSRETICULUMLITE_COMMIT }}
+          path: rsReticulumLite
+          token: ${{ secrets.PRIVATE_LITE_READ_TOKEN || github.token }}
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          repository: ${{ github.repository_owner }}/rsReticulum
+          ref: ${{ env.LXMFLITE_RSRETICULUM_COMMIT }}
+          path: rsReticulum
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          repository: ${{ github.repository_owner }}/rsLXMF
+          ref: ${{ env.LXMFLITE_RSLXMF_COMMIT }}
+          path: rsLXMF
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: rsLXMFLite -> target
+          cache-bin: false
+      - run: cargo +stable test --workspace --locked
+        working-directory: rsLXMFLite
+      - run: cargo +stable check --manifest-path api/fixtures/Cargo.toml --locked
+        working-directory: rsLXMFLite

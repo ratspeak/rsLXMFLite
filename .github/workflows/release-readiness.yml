@@ -1,0 +1,76 @@
+name: Release readiness
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Existing branch, tag, or commit to qualify
+        required: true
+        default: main
+
+permissions:
+  contents: read
+
+env:
+  LXMFLITE_RSRETICULUMLITE_COMMIT: ad17e4ce33174c73b6890856a6e205139ecc6f4e
+  LXMFLITE_RSRETICULUM_COMMIT: 3b3eb29c16c9dbc114c9b31d9f912a7b1a68652c
+  LXMFLITE_RSLXMF_COMMIT: e210e0c244c76532faae99696f83c94d44c27dc6
+
+jobs:
+  qualify:
+    name: Qualify source without publishing
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.source_ref }}
+          path: rsLXMFLite
+          fetch-depth: 0
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          repository: ${{ github.repository_owner }}/rsReticulumLite
+          ref: ${{ env.LXMFLITE_RSRETICULUMLITE_COMMIT }}
+          path: rsReticulumLite
+          token: ${{ secrets.PRIVATE_LITE_READ_TOKEN || github.token }}
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          repository: ${{ github.repository_owner }}/rsReticulum
+          ref: ${{ env.LXMFLITE_RSRETICULUM_COMMIT }}
+          path: rsReticulum
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          repository: ${{ github.repository_owner }}/rsLXMF
+          ref: ${{ env.LXMFLITE_RSLXMF_COMMIT }}
+          path: rsLXMF
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: 1.87.0
+          components: clippy, rustfmt
+          targets: thumbv7em-none-eabihf,riscv32imc-unknown-none-elf
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: rsLXMFLite -> target
+          cache-bin: false
+      - name: Run strict release matrix
+        working-directory: rsLXMFLite
+        run: ./scripts/release-matrix.sh
+      - name: Stage review-only source archive
+        working-directory: rsLXMFLite
+        shell: bash
+        run: |
+          set -euo pipefail
+          git archive --format=tar --prefix=rsLXMFLite-source/ HEAD | gzip -n > rsLXMFLite-source.tar.gz
+          sha256sum rsLXMFLite-source.tar.gz > SHA256SUMS
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: rsLXMFLite-release-candidate
+          path: |
+            rsLXMFLite/rsLXMFLite-source.tar.gz
+            rsLXMFLite/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14

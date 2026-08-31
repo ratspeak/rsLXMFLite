@@ -1,0 +1,40 @@
+name: Bug report
+description: Report reproducible codec, parser, compatibility, or build behavior
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: For security-sensitive reports, stop and follow SECURITY.md instead.
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: Exact rsLXMFLite commit or release tag
+    validations:
+      required: true
+  - type: input
+    id: target
+    attributes:
+      label: Target
+      description: Host or MCU compilation target
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Minimal message/vector/code and the command used
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      render: shell
