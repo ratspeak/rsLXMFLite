@@ -13,14 +13,14 @@ Reticulum cryptography and identity handling.
 
 ## Scope
 
-The codec supports opportunistic messages, current and retained ratchets, and
-packed messages carried over Links or Resources. It verifies destination,
-source and signature bindings and provides bounded MessagePack field access.
+The codec builds messages for single-packet (opportunistic) delivery or delivery
+over Links and Resources. It validates incoming messages against the sender's
+key and intended recipient, and supports current and retained destination ratchets.
 
-The caller supplies identities, entropy, timestamps and buffers. Routing,
-Link lifecycle, Resource scheduling, persistence and delivery policy belong
-to the firmware. Propagation-node operation, compression and stamps are outside
-this crate.
+Incoming message fields can be read; builders currently emit empty fields.
+Your firmware supplies identities, entropy, timestamps and buffers, and handles
+routing, Link sessions, Resource transfers, storage and retries. This crate does
+not run a propagation node or generate stamps, and does not support compression.
 
 ## Build and test
 
@@ -58,8 +58,7 @@ Keep both source revisions pinned in your build.
 [`TRUSTED_REF`](TRUSTED_REF) records the test references.
 The crates are distributed from source, not crates.io.
 
-See the [Link-message example](crates/lxmf-lite-core/examples/link_message.rs)
-and [codec boundaries](docs/status-and-scope.md).
+See the [Link-message example](crates/lxmf-lite-core/examples/link_message.rs).
 Build API documentation with `cargo doc --workspace --no-deps --open`.
 
 ## License
