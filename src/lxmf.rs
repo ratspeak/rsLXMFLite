@@ -80,57 +80,107 @@ impl From<CryptoError> for LxmfError {
 
 // ---- minimal msgpack for [f64, bin, bin, map] ----
 
-/// Append a msgpack bin (`bin8`/`bin16`/`bin32`) of `data` at `pos`; returns the new position.
-fn put_bin(out: &mut [u8], pos: usize, data: &[u8]) -> Result<usize, LxmfError> {
-    let len = data.len();
-    let header = if len <= u8::MAX as usize {
-        3
-    } else if len <= u16::MAX as usize {
-        4
-    } else {
-        6
-    } + len;
-    if pos + header > out.len() {
-        return Err(LxmfError::OutputTooSmall);
-    }
-    let mut p = pos;
-    if len <= u8::MAX as usize {
-        out[p] = 0xc4;
-        out[p + 1] = len as u8;
-        p += 2;
-    } else if len <= u16::MAX as usize {
-        out[p] = 0xc5;
-        out[p + 1..p + 3].copy_from_slice(&(len as u16).to_be_bytes());
-        p += 3;
-    } else {
-        out[p] = 0xc6;
-        out[p + 1..p + 5].copy_from_slice(&(len as u32).to_be_bytes());
-        p += 5;
-    }
-    out[p..p + len].copy_from_slice(data);
-    Ok(p + len)
+// Both construction and size admission run this encoder, following the trusted
+// full Rust codec's count-only writer pattern. No second framing formula is kept.
+trait PayloadWriter {
+    type Field;
+    fn write(&mut self, bytes: &[u8]) -> Result<(), LxmfError>;
+    fn field_len(field: &Self::Field) -> usize;
+    fn field(&mut self, field: Self::Field) -> Result<(), LxmfError>;
 }
 
-/// Pack `[timestamp, title, content, {}]` into `out`; returns the payload length.
+struct SliceWriter<'a> {
+    output: &'a mut [u8],
+    position: usize,
+}
+impl<'a> PayloadWriter for SliceWriter<'a> {
+    type Field = &'a [u8];
+    fn write(&mut self, bytes: &[u8]) -> Result<(), LxmfError> {
+        let end = self
+            .position
+            .checked_add(bytes.len())
+            .ok_or(LxmfError::TooLong)?;
+        let destination = self
+            .output
+            .get_mut(self.position..end)
+            .ok_or(LxmfError::OutputTooSmall)?;
+        destination.copy_from_slice(bytes);
+        self.position = end;
+        Ok(())
+    }
+    fn field_len(field: &Self::Field) -> usize {
+        field.len()
+    }
+    fn field(&mut self, field: Self::Field) -> Result<(), LxmfError> {
+        self.write(field)
+    }
+}
+
+struct SizeWriter(usize);
+impl PayloadWriter for SizeWriter {
+    type Field = usize;
+    fn write(&mut self, bytes: &[u8]) -> Result<(), LxmfError> {
+        self.field(bytes.len())
+    }
+    fn field_len(field: &Self::Field) -> usize {
+        *field
+    }
+    fn field(&mut self, length: Self::Field) -> Result<(), LxmfError> {
+        self.0 = self.0.checked_add(length).ok_or(LxmfError::TooLong)?;
+        Ok(())
+    }
+}
+
+fn write_bin<W: PayloadWriter>(writer: &mut W, field: W::Field) -> Result<(), LxmfError> {
+    let length = W::field_len(&field);
+    if length <= u8::MAX as usize {
+        writer.write(&[0xc4, length as u8])?;
+    } else if length <= u16::MAX as usize {
+        writer.write(&[0xc5])?;
+        writer.write(&(length as u16).to_be_bytes())?;
+    } else {
+        let length = u32::try_from(length).map_err(|_| LxmfError::TooLong)?;
+        writer.write(&[0xc6])?;
+        writer.write(&length.to_be_bytes())?;
+    }
+    writer.field(field)
+}
+
+fn write_payload<W: PayloadWriter>(
+    writer: &mut W,
+    timestamp: f64,
+    title: W::Field,
+    content: W::Field,
+) -> Result<(), LxmfError> {
+    writer.write(&[0x94, 0xcb])?; // [timestamp, title, content, fields]
+    writer.write(&timestamp.to_be_bytes())?;
+    write_bin(writer, title)?;
+    write_bin(writer, content)?;
+    writer.write(&[0x80]) // empty fields map
+}
+
+/// Exact full packed LXMF length, without allocating, reading message bodies,
+/// signing, or requiring an identity. Hashes and the signature have fixed size;
+/// the same payload encoder chooses bin8/bin16/bin32 in construction and counting.
+pub fn packed_len(title_len: usize, content_len: usize) -> Result<usize, LxmfError> {
+    let mut writer = SizeWriter(LXMF_PACKED_PREFIX);
+    write_payload(&mut writer, 0.0, title_len, content_len)?;
+    Ok(writer.0)
+}
+
+/// Pack `[timestamp, title, content, {}]` into `out`.
 fn pack_payload(
     timestamp: f64,
     title: &[u8],
     content: &[u8],
     out: &mut [u8],
 ) -> Result<usize, LxmfError> {
-    if out.len() < 10 {
-        return Err(LxmfError::OutputTooSmall);
-    }
-    out[0] = 0x94; // fixarray, 4 elements
-    out[1] = 0xcb; // float64
-    out[2..10].copy_from_slice(&timestamp.to_be_bytes());
-    let mut p = put_bin(out, 10, title)?;
-    p = put_bin(out, p, content)?;
-    if p + 1 > out.len() {
-        return Err(LxmfError::OutputTooSmall);
-    }
-    out[p] = 0x80; // fixmap, 0 entries (empty fields)
-    Ok(p + 1)
+    let mut writer = SliceWriter {
+        output: out,
+        position: 0,
+    };
+    write_payload(&mut writer, timestamp, title, content)?;
+    Ok(writer.position)
 }
 
 /// Skip one msgpack value starting at `pos`; returns the position just past it (ALWAYS
@@ -1075,6 +1125,39 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn packed_size_uses_exact_encoder_at_all_handheld_splits_and_bin_boundaries() {
+        for (title_len, content_len) in (0..=3659).map(|title| (title, 3659 - title)).chain(
+            [0, 1, 31, 32, 255, 256, 65535, 65536]
+                .into_iter()
+                .flat_map(|title| {
+                    [0, 255, 256, 65535, 65536]
+                        .into_iter()
+                        .map(move |content| (title, content))
+                }),
+        ) {
+            let title = std::vec![0x11; title_len];
+            let content = std::vec![0x22; content_len];
+            let size = packed_len(title_len, content_len).unwrap();
+            let mut payload = std::vec![0; size - LXMF_PACKED_PREFIX];
+            assert_eq!(
+                pack_payload(1.0, &title, &content, &mut payload).unwrap(),
+                payload.len()
+            );
+            assert_eq!(
+                pack_payload(
+                    1.0,
+                    &title,
+                    &content,
+                    &mut payload[..size - LXMF_PACKED_PREFIX - 1]
+                ),
+                Err(LxmfError::OutputTooSmall)
+            );
+        }
+        assert!(packed_len(usize::MAX, 0).is_err());
+        assert!(packed_len(0, usize::MAX).is_err());
     }
 
     #[test]

@@ -17,6 +17,6 @@ pub mod lxmf;
 pub use lxmf::{
     LXMF_DEST_LENGTH, LXMF_PACKED_PREFIX, LXMF_SIGNATURE_LENGTH, LxmfError, LxmfView,
     MAX_LXMF_PAYLOAD, MESSAGE_ID_LENGTH, build_link, build_opportunistic,
-    build_plaintext_for_parity, parse_link, parse_opportunistic, parse_opportunistic_ratchet_hint,
-    peek_source_opportunistic,
+    build_plaintext_for_parity, packed_len, parse_link, parse_opportunistic,
+    parse_opportunistic_ratchet_hint, peek_source_opportunistic,
 };

@@ -62,6 +62,50 @@ fn trusted_message() -> LxMessage {
     msg
 }
 
+#[test]
+fn exact_size_and_direct_wire_match_trusted_encoder() {
+    let source = LocalIdentity::from_private_key(&SOURCE_PRV);
+    let recipient = LocalIdentity::from_private_key(&RECIPIENT_PRV);
+    for length in [0, 1, 31, 32, 255, 256, 3546, 3547, 65535, 65536] {
+        let title = "t".repeat(length);
+        let content = "c".repeat(length / 2);
+        let mut trusted = LxMessage::new(
+            recipient.lxmf_delivery_hash(),
+            source.lxmf_delivery_hash(),
+            &title,
+            &content,
+            DeliveryMethod::Direct,
+        );
+        trusted.timestamp = TIMESTAMP;
+        let seed: [u8; 32] = SOURCE_PRV[32..].try_into().unwrap();
+        trusted
+            .sign(&rns_crypto::ed25519::Ed25519PrivateKey::from_bytes(&seed))
+            .unwrap();
+        let size = lxmf_lite_core::packed_len(title.len(), content.len()).unwrap();
+        assert_eq!(size, trusted.packed_len().unwrap());
+        let mut packed = vec![0; size];
+        let mut scratch = vec![0; size];
+        let mut destination = [0; 16];
+        let mut message_id = [0; 32];
+        assert_eq!(
+            lxmf_lite_core::build_link(
+                &source,
+                recipient.public_key(),
+                TIMESTAMP,
+                title.as_bytes(),
+                content.as_bytes(),
+                &mut packed,
+                &mut scratch,
+                &mut destination,
+                &mut message_id
+            )
+            .unwrap(),
+            size
+        );
+        assert_eq!(packed, trusted.pack().unwrap());
+    }
+}
+
 // The lite plaintext builder must be byte-identical to the trusted lxmf-core pack()
 // (same msgpack payload, hash, and deterministic Ed25519 signature).
 #[test]
