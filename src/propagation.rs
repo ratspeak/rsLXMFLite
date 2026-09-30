@@ -90,15 +90,22 @@ pub fn response_data<'a>(data: &'a [u8], expected_id: &[u8; 16]) -> Result<&'a [
 /// Validate the entire node list but retain only the first ID (smallest message
 /// first on a conforming node). Re-list after a bounded fetch/purge cycle.
 pub fn first_available(data: &[u8]) -> Result<(Option<[u8; 32]>, usize), LxmfError> {
+    available_at(data, 0)
+}
+
+/// Validate every advertised ID, retaining only the requested position. A
+/// bounded client can skip an undecryptable entry without caching the whole
+/// inbox or allowing that entry to block all later messages.
+pub fn available_at(data: &[u8], index: usize) -> Result<(Option<[u8; 32]>, usize), LxmfError> {
     let items = array_items(data)?;
     let count = items.len();
     let mut first = None;
-    for item in items {
+    for (position, item) in items.enumerate() {
         let id: [u8; 32] = value_as_bytes(item)
             .ok_or(LxmfError::MalformedPayload)?
             .try_into()
             .map_err(|_| LxmfError::MalformedPayload)?;
-        if first.is_none() {
+        if position == index {
             first = Some(id);
         }
     }

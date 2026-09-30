@@ -87,6 +87,19 @@ fn matched_trusted_replies_are_borrowed_and_all_list_items_validated() {
     assert!(first_available(&malformed_last).is_err());
     assert!(first_available(&[0xF0]).is_err()); // node error is not an empty inbox
     assert_eq!(first_available(&[0x90]).unwrap(), (None, 0));
+    assert!(available_at(&malformed_last, 0).is_err());
+    assert!(available_at(&malformed_last, usize::MAX).is_err());
+    let distinct = pack(Value::Array(
+        (0..106).map(|n| Value::Binary(vec![n; 32])).collect(),
+    ));
+    for index in 0..106 {
+        assert_eq!(
+            available_at(&distinct, index).unwrap(),
+            (Some([index as u8; 32]), 106)
+        );
+    }
+    assert_eq!(available_at(&distinct, 106).unwrap(), (None, 106));
+    assert_eq!(available_at(&distinct, usize::MAX).unwrap(), (None, 106));
 }
 
 #[test]
