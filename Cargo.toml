@@ -34,3 +34,5 @@ hkdf = { version = "0.12", default-features = false }
 lxmf-core = { path = "../rsLXMF/crates/lxmf-core", version = "1.2.0" }
 rns-identity = { path = "../rsReticulum/crates/rns-identity", version = "1.2.0" }
 rns-crypto = { path = "../rsReticulum/crates/rns-crypto", version = "1.2.0" }
+rns-link = { path = "../rsReticulum/crates/rns-link", version = "1.2.0" }
+rmpv = "1"

@@ -6,6 +6,118 @@ use crate::lxmf::{LXMF_PACKED_PREFIX, LxmfError, field_value, skip_value, value_
 use rns_lite_core::{crypto, identity::identity_hash};
 use sha2::{Digest, Sha256};
 
+/// One bounded `/get` operation. Fetch never includes haves: deleting a remote
+/// copy requires a separate Purge after the embedding storage owner commits it.
+#[derive(Clone, Copy, Debug)]
+pub enum GetRequest<'a> {
+    List,
+    Fetch {
+        transient_id: &'a [u8; 32],
+        limit_bytes: u16,
+    },
+    Purge {
+        durable_transient_id: &'a [u8; 32],
+    },
+}
+
+/// Pack the Link REQUEST plaintext `[timestamp, hash("/get"), data]`.
+/// Adapted from `rns-link::Link::prepare_request` and the LXMF propagation client.
+/// Always fits a Link packet. The request ID is the TRANSMITTED packet hash's
+/// first 16 bytes, not the hash of these plaintext bytes. The host must install
+/// that ID, Link incarnation and deadline before driver admission/callbacks.
+pub fn build_get_request(
+    timestamp: f64,
+    request: GetRequest<'_>,
+    out: &mut [u8],
+) -> Result<usize, LxmfError> {
+    if !timestamp.is_finite()
+        || timestamp < 0.0
+        || matches!(request, GetRequest::Fetch { limit_bytes: 0, .. })
+    {
+        return Err(LxmfError::MalformedPayload);
+    }
+    let body_len = match request {
+        GetRequest::List => 3,
+        GetRequest::Purge { .. } => 37,
+        GetRequest::Fetch { .. } => 46,
+    };
+    let total = 28 + body_len;
+    if out.len() < total {
+        return Err(LxmfError::OutputTooSmall);
+    }
+    out[0] = 0x93;
+    out[1] = 0xcb;
+    out[2..10].copy_from_slice(&timestamp.to_be_bytes());
+    out[10..12].copy_from_slice(&[0xc4, 16]);
+    out[12..28].copy_from_slice(&Sha256::digest(b"/get")[..16]);
+    match request {
+        GetRequest::List => out[28..31].copy_from_slice(&[0x92, 0xc0, 0xc0]),
+        GetRequest::Purge {
+            durable_transient_id,
+        } => {
+            out[28..33].copy_from_slice(&[0x92, 0xc0, 0x91, 0xc4, 32]);
+            out[33..65].copy_from_slice(durable_transient_id);
+        }
+        GetRequest::Fetch {
+            transient_id,
+            limit_bytes,
+        } => {
+            out[28..32].copy_from_slice(&[0x93, 0x91, 0xc4, 32]);
+            out[32..64].copy_from_slice(transient_id);
+            out[64] = 0x90; // no purge during fetch
+            out[65] = 0xcb;
+            out[66..74].copy_from_slice(&(f64::from(limit_bytes) / 1000.0).to_be_bytes());
+        }
+    }
+    Ok(total)
+}
+
+/// Validate a decrypted packet/Resource RESPONSE envelope against its one live
+/// request. Returns the borrowed, still-encoded response value. Unlike the full
+/// parser this rejects extra envelope elements and trailing data.
+pub fn response_data<'a>(data: &'a [u8], expected_id: &[u8; 16]) -> Result<&'a [u8], LxmfError> {
+    let mut items = array_items(data)?;
+    if items.len() != 2 {
+        return Err(LxmfError::MalformedPayload);
+    }
+    let id = items.next().ok_or(LxmfError::MalformedPayload)?;
+    if value_as_bytes(id) != Some(expected_id.as_slice()) {
+        return Err(LxmfError::MalformedPayload);
+    }
+    items.next().ok_or(LxmfError::MalformedPayload)
+}
+
+/// Validate the entire node list but retain only the first ID (smallest message
+/// first on a conforming node). Re-list after a bounded fetch/purge cycle.
+pub fn first_available(data: &[u8]) -> Result<(Option<[u8; 32]>, usize), LxmfError> {
+    let items = array_items(data)?;
+    let count = items.len();
+    let mut first = None;
+    for item in items {
+        let id: [u8; 32] = value_as_bytes(item)
+            .ok_or(LxmfError::MalformedPayload)?
+            .try_into()
+            .map_err(|_| LxmfError::MalformedPayload)?;
+        if first.is_none() {
+            first = Some(id);
+        }
+    }
+    Ok((first, count))
+}
+
+/// A one-message fetch may return an empty list (gone/limit refusal), or one
+/// encrypted entry. Refuse unsolicited extra entries and malformed item types.
+pub fn fetched_message(data: &[u8]) -> Result<Option<&[u8]>, LxmfError> {
+    let mut items = array_items(data)?;
+    if items.len() > 1 {
+        return Err(LxmfError::MalformedPayload);
+    }
+    items
+        .next()
+        .map(|item| value_as_bytes(item).ok_or(LxmfError::MalformedPayload))
+        .transpose()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NodeAnnounce<'a> {
     pub timebase: u64,

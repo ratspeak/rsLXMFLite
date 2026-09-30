@@ -317,8 +317,10 @@ dependencies = [
  "ed25519-dalek",
  "hkdf",
  "lxmf-core",
+ "rmpv",
  "rns-crypto",
  "rns-identity",
+ "rns-link",
  "rns-lite-core",
  "sha2",
 ]
