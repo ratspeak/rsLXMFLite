@@ -16,6 +16,10 @@ Reticulum cryptography and identity handling.
 The codec builds messages for single-packet (opportunistic) delivery or delivery
 over Links and Resources. It validates incoming messages against the sender's
 key and intended recipient, and supports current and retained destination ratchets.
+Client propagation codecs validate node announcements, append recipient stamps,
+encrypt and wrap relay uploads, and decrypt retrieved entries for the ordinary
+message validator. Relay selection and durable inbox acknowledgement remain
+the firmware's responsibility.
 
 Incoming message fields can be read; builders currently emit empty fields.
 Your firmware supplies identities, entropy, timestamps and buffers, and handles

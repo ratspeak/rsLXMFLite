@@ -13,6 +13,7 @@
 extern crate std;
 
 pub mod lxmf;
+pub mod propagation;
 pub mod stamp;
 
 pub use lxmf::{

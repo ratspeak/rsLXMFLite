@@ -189,7 +189,7 @@ fn pack_payload(
 /// 0xFFFFFFFF bin32 that would wrap a 32-bit `usize` on the ESP32-S3) can never read OOB or return a
 /// position past the buffer. Bounded recursion (depth <= 8). Supports the types LXMF payloads/fields
 /// use (ints, bin/str, float, nil, bool, arrays, maps).
-fn skip_value(data: &[u8], pos: usize, depth: u8) -> Result<usize, LxmfError> {
+pub(crate) fn skip_value(data: &[u8], pos: usize, depth: u8) -> Result<usize, LxmfError> {
     if depth > 8 || pos >= data.len() {
         return Err(LxmfError::MalformedPayload);
     }
