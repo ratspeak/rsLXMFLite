@@ -19,8 +19,11 @@ key and intended recipient, and supports current and retained destination ratche
 
 Incoming message fields can be read; builders currently emit empty fields.
 Your firmware supplies identities, entropy, timestamps and buffers, and handles
-routing, Link sessions, Resource transfers, storage and retries. This crate does
-not run a propagation node or generate stamps, and does not support compression.
+routing, Link sessions, Resource transfers, storage and retries. Resumable stamp
+generation and validation stream workblock preparation without allocating the
+large workblock. Firmware supplies fresh cryptographic entropy and enforces cost,
+iteration and elapsed-time limits. This crate does not run a propagation node
+and does not support compression.
 
 ## Build and test
 

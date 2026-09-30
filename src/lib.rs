@@ -13,6 +13,7 @@
 extern crate std;
 
 pub mod lxmf;
+pub mod stamp;
 
 pub use lxmf::{
     LXMF_DEST_LENGTH, LXMF_PACKED_PREFIX, LXMF_SIGNATURE_LENGTH, LxmfError, LxmfView,

@@ -25,6 +25,8 @@ unsafe_code = "forbid"
 rns-lite-core = { path = "../rsReticulumLite", version = "0.1.0" }
 # Signature verification on inbound messages; same no_std pin as rns-lite-core.
 ed25519-dalek = { version = "2", default-features = false, features = ["fast", "zeroize"] }
+sha2 = { version = "0.10", default-features = false }
+hkdf = { version = "0.12", default-features = false }
 
 [dev-dependencies]
 # Trusted full-Rust cross-checks (host-only): byte-exact codec parity vs lxmf-core and
