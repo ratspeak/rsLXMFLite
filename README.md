@@ -21,7 +21,10 @@ encrypt and wrap relay uploads, and decrypt retrieved entries for the ordinary
 message validator. Relay selection and durable inbox acknowledgement remain
 the firmware's responsibility.
 
-Incoming message fields can be read; builders currently emit empty fields.
+Incoming message fields can be read without allocation. The Link/Resource audio
+builder writes standard LXMF `[mode, binary]` audio fields covered by the message
+signature; text and opportunistic builders retain empty fields. Audio framing is
+separate from codec support, playback and application size/duration limits.
 Your firmware supplies identities, entropy, timestamps and buffers, and handles
 routing, Link sessions, Resource transfers, storage and retries. Resumable stamp
 generation and validation stream workblock preparation without allocating the

@@ -13,7 +13,8 @@
 //! everything after it is ECIES-encrypted to the recipient identity ([`rns_lite_core::crypto`]). The plaintext
 //! `packed` is deterministic given a fixed timestamp, so it is byte-exact provable vs Python LXMF.
 //!
-//! Builders emit empty `fields`; parsers tolerate non-empty fields and a trailing
+//! Text builders emit empty `fields`; audio Link/Resource builders emit native
+//! `FIELD_AUDIO`. Parsers tolerate non-empty fields and a trailing
 //! stamp element (stripped before hashing/verifying, matching `LXMessage.unpack_from_bytes`).
 //!
 //! Notes / known limitations:
@@ -41,6 +42,22 @@ use rns_lite_core::wire::sha256;
 pub const LXMF_DEST_LENGTH: usize = 16;
 pub const LXMF_SIGNATURE_LENGTH: usize = 64;
 pub const MESSAGE_ID_LENGTH: usize = 32;
+
+/// Standard LXMF audio field identifier (not an LXST codec identifier).
+pub const FIELD_AUDIO: u8 = 0x07;
+/// Standard LXMF native Codec2 700C audio mode.
+pub const AM_CODEC2_700C: u8 = 0x03;
+
+/// Standard `[mode, binary]` audio, borrowed without decoding or allocation.
+///
+/// Adapted from `lxmf_core::message::AudioField`. Valid field framing does not
+/// imply that an application can decode the mode or that the codec data is valid.
+/// Apply local size/duration and codec validation before playback. Never autoplay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AudioField<'a> {
+    pub mode: u8,
+    pub bytes: &'a [u8],
+}
 
 /// `source_hash(16) + signature(64)` prefix the ECIES plaintext carries before the msgpack payload.
 const PLAINTEXT_PREFIX: usize = LXMF_DEST_LENGTH + LXMF_SIGNATURE_LENGTH;
@@ -151,12 +168,25 @@ fn write_payload<W: PayloadWriter>(
     timestamp: f64,
     title: W::Field,
     content: W::Field,
+    audio: Option<(u8, W::Field)>,
 ) -> Result<(), LxmfError> {
     writer.write(&[0x94, 0xcb])?; // [timestamp, title, content, fields]
     writer.write(&timestamp.to_be_bytes())?;
     write_bin(writer, title)?;
     write_bin(writer, content)?;
-    writer.write(&[0x80]) // empty fields map
+    if let Some((mode, bytes)) = audio {
+        // Donor: lxmf-core AudioFieldRef + native fields-map writer. The value
+        // is an array containing an integer and bin, never a bin-wrapped array.
+        writer.write(&[0x81, FIELD_AUDIO, 0x92])?;
+        if mode <= 0x7f {
+            writer.write(&[mode])?;
+        } else {
+            writer.write(&[0xcc, mode])?;
+        }
+        write_bin(writer, bytes)
+    } else {
+        writer.write(&[0x80])
+    }
 }
 
 /// Exact full packed LXMF length, without allocating, reading message bodies,
@@ -164,7 +194,29 @@ fn write_payload<W: PayloadWriter>(
 /// the same payload encoder chooses bin8/bin16/bin32 in construction and counting.
 pub fn packed_len(title_len: usize, content_len: usize) -> Result<usize, LxmfError> {
     let mut writer = SizeWriter(LXMF_PACKED_PREFIX);
-    write_payload(&mut writer, 0.0, title_len, content_len)?;
+    write_payload(&mut writer, 0.0, title_len, content_len, None)?;
+    Ok(writer.0)
+}
+
+/// Exact signed Link/Resource message size with one native audio field.
+///
+/// No stamp or propagation encryption/wrapper is included. Admission must add
+/// those actual costs separately. Counting uses the same encoder as construction
+/// and rejects lengths beyond MessagePack bin32 or overflowing `usize`.
+pub fn packed_len_with_audio(
+    title_len: usize,
+    content_len: usize,
+    mode: u8,
+    audio_len: usize,
+) -> Result<usize, LxmfError> {
+    let mut writer = SizeWriter(LXMF_PACKED_PREFIX);
+    write_payload(
+        &mut writer,
+        0.0,
+        title_len,
+        content_len,
+        Some((mode, audio_len)),
+    )?;
     Ok(writer.0)
 }
 
@@ -175,11 +227,27 @@ fn pack_payload(
     content: &[u8],
     out: &mut [u8],
 ) -> Result<usize, LxmfError> {
+    pack_payload_with_audio(timestamp, title, content, None, out)
+}
+
+fn pack_payload_with_audio(
+    timestamp: f64,
+    title: &[u8],
+    content: &[u8],
+    audio: Option<AudioField<'_>>,
+    out: &mut [u8],
+) -> Result<usize, LxmfError> {
     let mut writer = SliceWriter {
         output: out,
         position: 0,
     };
-    write_payload(&mut writer, timestamp, title, content)?;
+    write_payload(
+        &mut writer,
+        timestamp,
+        title,
+        content,
+        audio.map(|a| (a.mode, a.bytes)),
+    )?;
     Ok(writer.position)
 }
 
@@ -687,6 +755,67 @@ pub fn build_link(
     out_dest_hash: &mut [u8; LXMF_DEST_LENGTH],
     out_message_id: &mut [u8; MESSAGE_ID_LENGTH],
 ) -> Result<usize, LxmfError> {
+    build_link_inner(
+        source,
+        recipient_public_key,
+        timestamp,
+        title,
+        content,
+        None,
+        out,
+        scratch,
+        out_dest_hash,
+        out_message_id,
+    )
+}
+
+/// Build a signed Link/Resource message containing one standard LXMF audio field.
+///
+/// Audio bytes are covered by the same message ID/signature as title and content.
+/// The resulting packed message also works with the existing recipient-stamp and
+/// propagation envelope helpers. Scratch/capacity requirements match [`build_link`].
+/// No decoding, playback or duration policy is imposed by the message codec.
+/// The existing text builder and opportunistic APIs remain unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn build_link_with_audio(
+    source: &LocalIdentity,
+    recipient_public_key: &[u8; 64],
+    timestamp: f64,
+    title: &[u8],
+    content: &[u8],
+    audio: AudioField<'_>,
+    out: &mut [u8],
+    scratch: &mut [u8],
+    out_dest_hash: &mut [u8; LXMF_DEST_LENGTH],
+    out_message_id: &mut [u8; MESSAGE_ID_LENGTH],
+) -> Result<usize, LxmfError> {
+    build_link_inner(
+        source,
+        recipient_public_key,
+        timestamp,
+        title,
+        content,
+        Some(audio),
+        out,
+        scratch,
+        out_dest_hash,
+        out_message_id,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_link_inner(
+    source: &LocalIdentity,
+    recipient_public_key: &[u8; 64],
+    timestamp: f64,
+    title: &[u8],
+    content: &[u8],
+    audio: Option<AudioField<'_>>,
+    out: &mut [u8],
+    scratch: &mut [u8],
+    out_dest_hash: &mut [u8; LXMF_DEST_LENGTH],
+    out_message_id: &mut [u8; MESSAGE_ID_LENGTH],
+) -> Result<usize, LxmfError> {
     if scratch.len() < 64 + 11 || out.len() < LXMF_PACKED_PREFIX + 11 {
         return Err(LxmfError::OutputTooSmall);
     }
@@ -697,10 +826,11 @@ pub fn build_link(
 
     // scratch = dest(16) || source(16) || payload(plen) || hash(32); payload packed in place.
     let scratch_len = scratch.len();
-    let plen = pack_payload(
+    let plen = pack_payload_with_audio(
         timestamp,
         title,
         content,
+        audio,
         &mut scratch[32..scratch_len - 32],
     )
     .map_err(|_| LxmfError::TooLong)?;
@@ -823,6 +953,68 @@ pub fn field_value(fields: &[u8], key: u8) -> Option<&[u8]> {
         pos = after_value;
     }
     found
+}
+
+/// Inspect a native audio field in an authenticated message's fields map.
+///
+/// Adapted from `lxmf_core::message::LxMessage::audio_field`: requires exactly
+/// `[integer in 0..=255, binary]`, with no trailing bytes. Unknown modes remain
+/// inspectable for unsupported-media UI; valid framing does not mean decodable
+/// audio. A malformed field does not change authentication of its enclosing
+/// message. Duplicate keys use the last value, matching the full Rust map.
+/// Recursion and traversal remain bounded by the supplied map slice.
+pub fn audio_field(fields: &[u8]) -> Result<Option<AudioField<'_>>, LxmfError> {
+    let (mut pos, count) = read_map_header(fields).ok_or(LxmfError::MalformedPayload)?;
+    let mut found = None;
+    for _ in 0..count {
+        let after_key = skip_value(fields, pos, 0)?;
+        let key = read_audio_integer(&fields[pos..after_key]).map(|(value, _)| value);
+        let after_value = skip_value(fields, after_key, 0)?;
+        if key == Some(FIELD_AUDIO) {
+            found = Some(&fields[after_key..after_value]);
+        }
+        pos = after_value;
+    }
+    if pos != fields.len() {
+        return Err(LxmfError::MalformedPayload);
+    }
+    let Some(value) = found else { return Ok(None) };
+    let array_header = match value {
+        [0x92, ..] => 1,
+        [0xdc, 0, 2, ..] => 3,
+        [0xdd, 0, 0, 0, 2, ..] => 5,
+        _ => return Err(LxmfError::MalformedPayload),
+    };
+    let (mode, width) =
+        read_audio_integer(&value[array_header..]).ok_or(LxmfError::MalformedPayload)?;
+    let bin_start = array_header + width;
+    if !matches!(value.get(bin_start), Some(0xc4..=0xc6)) {
+        return Err(LxmfError::MalformedPayload);
+    }
+    let (bytes, end) = read_bin(value, bin_start)?;
+    if end != value.len() {
+        return Err(LxmfError::MalformedPayload);
+    }
+    Ok(Some(AudioField { mode, bytes }))
+}
+
+// All signed/unsigned MessagePack integer encodings are accepted only when the
+// value fits u8. Zero high bytes simultaneously exclude negative signed values.
+fn read_audio_integer(value: &[u8]) -> Option<(u8, usize)> {
+    let marker = *value.first()?;
+    let width = match marker {
+        0x00..=0x7f => return Some((marker, 1)),
+        0xcc | 0xd0 => 1,
+        0xcd | 0xd1 => 2,
+        0xce | 0xd2 => 4,
+        0xcf | 0xd3 => 8,
+        _ => return None,
+    };
+    let number = value.get(1..1 + width)?;
+    if number[..width - 1].iter().any(|&b| b != 0) || (marker == 0xd0 && number[0] > 0x7f) {
+        return None;
+    }
+    Some((number[width - 1], width + 1))
 }
 
 /// The `bin`/`str` payload of a single msgpack value, if it is one.

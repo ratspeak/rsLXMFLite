@@ -33,3 +33,36 @@ pub fn parse<'a>(
 ) -> Result<LxmfView<'a>, LxmfError> {
     parse_link(recipient, packed, source.public_key(), scratch)
 }
+
+/// An external MCU caller supplies already encoded native audio and all storage.
+pub fn build_audio<'a>(
+    source: &LocalIdentity,
+    recipient: &LocalIdentity,
+    native: &[u8],
+    out: &'a mut [u8; 3659],
+    scratch: &mut [u8; 3659],
+) -> Result<&'a [u8], LxmfError> {
+    use lxmf_lite_core::{
+        AM_CODEC2_700C, AudioField, build_link_with_audio, packed_len_with_audio,
+    };
+    let expected = packed_len_with_audio(0, 13, AM_CODEC2_700C, native.len())?;
+    if expected > out.len() {
+        return Err(LxmfError::TooLong);
+    }
+    let n = build_link_with_audio(
+        source,
+        recipient.public_key(),
+        1_750_000_000.0,
+        b"",
+        b"Voice message",
+        AudioField {
+            mode: AM_CODEC2_700C,
+            bytes: native,
+        },
+        out,
+        scratch,
+        &mut [0; 16],
+        &mut [0; 32],
+    )?;
+    Ok(&out[..n])
+}

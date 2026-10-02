@@ -1,0 +1,17 @@
+{
+  "scope": "signed LXMF container; opaque synthetic bytes, not speech or network delivery",
+  "references": {
+    "Reticulum": "b48b96e61676504e0a4e527b33b9a0b4495c6872",
+    "LXMF": "a29c4a0e17c55a4556b0c772c9d080d479d99ae8"
+  },
+  "timestamp": 1234567890.5,
+  "source_test_key": "51 repeated 64 times",
+  "recipient_test_key": "52 repeated 64 times",
+  "audio_bytes": 1500,
+  "audio_generator": "byte i is i % 251",
+  "audio_mode": 3,
+  "packed_bytes": 1630,
+  "packed_sha256": "2c9d1140024b11265e862c04983cb8095c51d0443c484245856d7ba27c0ec65c",
+  "message_id": "59acb4fd6934926fdc5e937e9661d404701ee8778f1cfcf557932cbeb7f8b766",
+  "python_signature_validated": true
+}

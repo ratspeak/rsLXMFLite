@@ -17,8 +17,9 @@ pub mod propagation;
 pub mod stamp;
 
 pub use lxmf::{
-    LXMF_DEST_LENGTH, LXMF_PACKED_PREFIX, LXMF_SIGNATURE_LENGTH, LxmfError, LxmfView,
-    MAX_LXMF_PAYLOAD, MESSAGE_ID_LENGTH, build_link, build_opportunistic,
-    build_plaintext_for_parity, packed_len, parse_link, parse_opportunistic,
-    parse_opportunistic_ratchet_hint, peek_source_opportunistic,
+    AM_CODEC2_700C, AudioField, FIELD_AUDIO, LXMF_DEST_LENGTH, LXMF_PACKED_PREFIX,
+    LXMF_SIGNATURE_LENGTH, LxmfError, LxmfView, MAX_LXMF_PAYLOAD, MESSAGE_ID_LENGTH, audio_field,
+    build_link, build_link_with_audio, build_opportunistic, build_plaintext_for_parity, packed_len,
+    packed_len_with_audio, parse_link, parse_opportunistic, parse_opportunistic_ratchet_hint,
+    peek_source_opportunistic,
 };
