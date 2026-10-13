@@ -1,4 +1,8 @@
-use lxmf_core::{constants::DeliveryMethod, handlers, message::LxMessage};
+use lxmf_core::{
+    constants::DeliveryMethod,
+    handlers,
+    message::{LxMessage, LxMessageDraft, RecipientStamp},
+};
 use lxmf_lite_core::{build_link, parse_link, propagation::*};
 use rns_lite_core::identity::LocalIdentity;
 
@@ -122,25 +126,33 @@ fn recipient_stamp_and_propagation_envelope_preserve_signed_message() {
             .unwrap();
             let stamp = vec![0x72; stamp_len];
             let n = append_recipient_stamp(&mut buffer, n, &stamp).unwrap();
-            let mut trusted = LxMessage::new(
+            let mut trusted = LxMessageDraft::new(
                 recipient.lxmf_delivery_hash(),
                 source.lxmf_delivery_hash(),
                 "title",
                 &content,
                 DeliveryMethod::Propagated,
-            );
-            trusted.timestamp = 1234567890.5;
-            trusted.stamp = Some(stamp);
-            trusted
+            )
+            .unwrap();
+            trusted.set_timestamp(1234567890.5).unwrap();
+            let trusted = trusted
                 .sign(&rns_crypto::ed25519::Ed25519PrivateKey::from_bytes(
                     &[0x51; 32],
                 ))
+                .unwrap()
+                .finalize(RecipientStamp::from_bytes(&stamp))
                 .unwrap();
             assert_eq!(&buffer[..n], trusted.pack().unwrap());
             assert_eq!(
-                parse_link(&recipient, &buffer[..n], source.public_key(), &mut scratch)
-                    .unwrap()
-                    .message_id,
+                parse_link(
+                    &recipient,
+                    &buffer[..n],
+                    source.public_key(),
+                    &mut scratch,
+                    &mut lxmf_lite_core::LxmfFieldScratch::new()
+                )
+                .unwrap()
+                .message_id,
                 message_id
             );
             let (encrypted_len, tid) = encrypt_message(
@@ -182,6 +194,7 @@ fn recipient_stamp_and_propagation_envelope_preserve_signed_message() {
                 &incoming[..restored_len],
                 source.public_key(),
                 &mut scratch,
+                &mut lxmf_lite_core::LxmfFieldScratch::new(),
             )
             .unwrap();
             assert_eq!(view.message_id, message_id);

@@ -1,6 +1,6 @@
 //! Compile contract for representative use outside the rsLXMFLite workspace.
 
-use lxmf_lite_core::{LxmfError, LxmfView, build_link, parse_link};
+use lxmf_lite_core::{LxmfError, LxmfFieldScratch, LxmfView, build_link, parse_link};
 use rns_lite_core::LocalIdentity;
 
 pub fn build<'a>(
@@ -30,8 +30,15 @@ pub fn parse<'a>(
     source: &LocalIdentity,
     packed: &'a [u8],
     scratch: &mut [u8],
+    field_scratch: &mut LxmfFieldScratch,
 ) -> Result<LxmfView<'a>, LxmfError> {
-    parse_link(recipient, packed, source.public_key(), scratch)
+    parse_link(
+        recipient,
+        packed,
+        source.public_key(),
+        scratch,
+        field_scratch,
+    )
 }
 
 /// An external MCU caller supplies already encoded native audio and all storage.

@@ -4,7 +4,7 @@
 //! trusted-built (random-ephemeral) blobs must decrypt + verify in lite.
 
 use lxmf_core::constants::DeliveryMethod;
-use lxmf_core::message::LxMessage;
+use lxmf_core::message::{LxMessage, LxMessageDraft};
 use lxmf_lite_core::lxmf::{
     build_opportunistic, build_opportunistic_ratchet, build_plaintext_for_parity,
     parse_opportunistic, parse_opportunistic_ratchet, parse_opportunistic_ratchet_hint,
@@ -48,18 +48,20 @@ fn trusted_delivery_hash(identity: &rns_identity::identity::Identity) -> [u8; 16
 fn trusted_message() -> LxMessage {
     let source = trusted_identity(&SOURCE_PRV);
     let recipient = trusted_identity(&RECIPIENT_PRV);
-    let mut msg = LxMessage::new(
+    let mut msg = LxMessageDraft::new(
         trusted_delivery_hash(&recipient),
         trusted_delivery_hash(&source),
         "Hi",
         "hello world",
         DeliveryMethod::Opportunistic,
-    );
-    msg.timestamp = TIMESTAMP;
+    )
+    .unwrap();
+    msg.set_timestamp(TIMESTAMP).unwrap();
     let seed: [u8; 32] = SOURCE_PRV[32..].try_into().unwrap();
     msg.sign(&rns_crypto::ed25519::Ed25519PrivateKey::from_bytes(&seed))
-        .unwrap();
-    msg
+        .unwrap()
+        .finalize(None)
+        .unwrap()
 }
 
 #[test]
@@ -69,17 +71,20 @@ fn exact_size_and_direct_wire_match_trusted_encoder() {
     for length in [0, 1, 31, 32, 255, 256, 3546, 3547, 65535, 65536] {
         let title = "t".repeat(length);
         let content = "c".repeat(length / 2);
-        let mut trusted = LxMessage::new(
+        let mut trusted = LxMessageDraft::new(
             recipient.lxmf_delivery_hash(),
             source.lxmf_delivery_hash(),
             &title,
             &content,
             DeliveryMethod::Direct,
-        );
-        trusted.timestamp = TIMESTAMP;
+        )
+        .unwrap();
+        trusted.set_timestamp(TIMESTAMP).unwrap();
         let seed: [u8; 32] = SOURCE_PRV[32..].try_into().unwrap();
-        trusted
+        let trusted = trusted
             .sign(&rns_crypto::ed25519::Ed25519PrivateKey::from_bytes(&seed))
+            .unwrap()
+            .finalize(None)
             .unwrap();
         let size = lxmf_lite_core::packed_len(title.len(), content.len()).unwrap();
         assert_eq!(size, trusted.packed_len().unwrap());
@@ -132,7 +137,7 @@ fn lite_plaintext_byte_exact_vs_trusted_lxmf_core() {
     // trusted pack() = dest_hash || (lite plaintext: source_hash || signature || payload)
     assert_eq!(&trusted_packed[..16], &dest);
     assert_eq!(&trusted_packed[16..], &pt[..n]);
-    assert_eq!(msg.hash.unwrap(), mid);
+    assert_eq!(msg.message_id(), mid);
 }
 
 // A message packed + ECIES-encrypted by the trusted stack (random ephemeral) must
@@ -157,12 +162,13 @@ fn lite_parses_trusted_lxmf_core_opportunistic_blob() {
         &blob,
         lite_source.public_key(),
         &mut scratch,
+        &mut lxmf_lite_core::LxmfFieldScratch::new(),
     )
     .unwrap();
     assert_eq!(view.title, b"Hi");
     assert_eq!(view.content, b"hello world");
     assert_eq!(view.timestamp, TIMESTAMP);
-    assert_eq!(view.message_id, msg.hash.unwrap());
+    assert_eq!(view.message_id, msg.message_id());
     assert_eq!(view.source_hash, lite_source.lxmf_delivery_hash());
 }
 
@@ -195,19 +201,19 @@ fn trusted_lxmf_core_validates_lite_built_message() {
     let mut packed = Vec::with_capacity(16 + plaintext.len());
     packed.extend_from_slice(&dest);
     packed.extend_from_slice(&plaintext);
-    let mut msg = LxMessage::unpack(&packed).unwrap();
+    let msg = LxMessage::unpack(&packed).unwrap();
 
     let source_trusted = trusted_identity(&SOURCE_PRV);
     let ed_pub: [u8; 32] = source_trusted.get_public_key()[32..].try_into().unwrap();
     let verify_key = rns_crypto::ed25519::Ed25519PublicKey::from_bytes(&ed_pub).unwrap();
-    assert!(msg.verify(&verify_key));
-    assert_eq!(msg.title, "Hi");
-    assert_eq!(msg.content, "hello world");
-    assert_eq!(msg.timestamp, TIMESTAMP);
-    assert_eq!(msg.hash.unwrap(), mid);
-    assert_eq!(msg.source_hash, lite_source.lxmf_delivery_hash());
+    assert!(msg.verify_signature(&verify_key));
+    assert_eq!(msg.title_text(), "Hi");
+    assert_eq!(msg.content_text(), "hello world");
+    assert_eq!(msg.timestamp(), TIMESTAMP);
+    assert_eq!(msg.message_id(), mid);
+    assert_eq!(msg.source_hash(), lite_source.lxmf_delivery_hash());
     assert_eq!(
-        msg.destination_hash,
+        msg.destination_hash(),
         trusted_delivery_hash(&recipient_trusted)
     );
 }
@@ -238,7 +244,7 @@ fn lite_build_link_byte_exact_vs_trusted_pack() {
     let msg = trusted_message();
     let trusted_packed = msg.pack().unwrap();
     assert_eq!(&out[..n], &trusted_packed[..]);
-    assert_eq!(msg.hash.unwrap(), mid);
+    assert_eq!(msg.message_id(), mid);
 }
 
 // A trusted-built message with NON-EMPTY 1.0.1-standard fields (0x30 reply bin + 0x40
@@ -256,19 +262,23 @@ fn lite_parses_trusted_message_with_standard_fields() {
 
     let source = trusted_identity(&SOURCE_PRV);
     let recipient = trusted_identity(&RECIPIENT_PRV);
-    let mut msg = LxMessage::new(
+    let mut msg = LxMessageDraft::new(
         trusted_delivery_hash(&recipient),
         trusted_delivery_hash(&source),
         "Hi",
         "hello world",
         DeliveryMethod::Opportunistic,
-    );
-    msg.timestamp = TIMESTAMP;
-    msg.set_field(FIELD_REPLY_TO, reply_to.to_vec());
+    )
+    .unwrap();
+    msg.set_timestamp(TIMESTAMP).unwrap();
+    msg.set_field(FIELD_REPLY_TO, reply_to.to_vec()).unwrap();
     msg.set_msgpack_field(FIELD_REACTION, reaction.to_vec())
         .unwrap();
     let seed: [u8; 32] = SOURCE_PRV[32..].try_into().unwrap();
-    msg.sign(&rns_crypto::ed25519::Ed25519PrivateKey::from_bytes(&seed))
+    let msg = msg
+        .sign(&rns_crypto::ed25519::Ed25519PrivateKey::from_bytes(&seed))
+        .unwrap()
+        .finalize(None)
         .unwrap();
 
     let recipient_trusted = trusted_identity(&RECIPIENT_PRV);
@@ -288,11 +298,12 @@ fn lite_parses_trusted_message_with_standard_fields() {
         &blob,
         lite_source.public_key(),
         &mut scratch,
+        &mut lxmf_lite_core::LxmfFieldScratch::new(),
     )
     .unwrap();
     assert_eq!(view.title, b"Hi");
     assert_eq!(view.content, b"hello world");
-    assert_eq!(view.message_id, msg.hash.unwrap());
+    assert_eq!(view.message_id, msg.message_id());
     assert_eq!(
         field_value(view.fields, FIELD_REPLY_TO).and_then(value_as_bytes),
         Some(&reply_to[..])
@@ -308,9 +319,10 @@ fn lite_parses_trusted_message_with_standard_fields() {
         &trusted_packed,
         lite_source.public_key(),
         &mut scratch2,
+        &mut lxmf_lite_core::LxmfFieldScratch::new(),
     )
     .unwrap();
-    assert_eq!(view2.message_id, msg.hash.unwrap());
+    assert_eq!(view2.message_id, msg.message_id());
     assert_eq!(field_value(view2.fields, FIELD_REACTION), Some(reaction));
 }
 
@@ -328,12 +340,13 @@ fn lite_parse_link_validates_trusted_packed() {
         &trusted_packed,
         lite_source.public_key(),
         &mut scratch,
+        &mut lxmf_lite_core::LxmfFieldScratch::new(),
     )
     .unwrap();
     assert_eq!(view.title, b"Hi");
     assert_eq!(view.content, b"hello world");
     assert_eq!(view.timestamp, TIMESTAMP);
-    assert_eq!(view.message_id, msg.hash.unwrap());
+    assert_eq!(view.message_id, msg.message_id());
     assert_eq!(view.source_hash, lite_source.lxmf_delivery_hash());
 }
 
@@ -373,11 +386,12 @@ fn lite_parses_trusted_ratcheted_opportunistic_blob() {
         &blob,
         lite_source.public_key(),
         &mut scratch,
+        &mut lxmf_lite_core::LxmfFieldScratch::new(),
     )
     .unwrap();
     assert_eq!(view.title, b"Hi");
     assert_eq!(view.content, b"hello world");
-    assert_eq!(view.message_id, msg.hash.unwrap());
+    assert_eq!(view.message_id, msg.message_id());
 
     // A base-key blob still parses through the ratchet API with the fallback (never enforced).
     let base_blob = trusted_message()
@@ -399,6 +413,7 @@ fn lite_parses_trusted_ratcheted_opportunistic_blob() {
         &base_blob,
         lite_source.public_key(),
         &mut scratch,
+        &mut lxmf_lite_core::LxmfFieldScratch::new(),
     )
     .unwrap();
     assert_eq!(base_view.content, b"hello world");
@@ -415,6 +430,7 @@ fn lite_parses_trusted_ratcheted_opportunistic_blob() {
                 &blob,
                 lite_source.public_key(),
                 &mut scratch,
+                &mut lxmf_lite_core::LxmfFieldScratch::new()
             ),
             Err(lxmf_lite_core::lxmf::LxmfError::Crypto)
         );
@@ -457,14 +473,14 @@ fn trusted_validates_lite_ratcheted_built_message() {
     let mut packed = Vec::with_capacity(16 + plaintext.len());
     packed.extend_from_slice(&dest);
     packed.extend_from_slice(&plaintext);
-    let mut msg = LxMessage::unpack(&packed).unwrap();
+    let msg = LxMessage::unpack(&packed).unwrap();
 
     let source_trusted = trusted_identity(&SOURCE_PRV);
     let ed_pub: [u8; 32] = source_trusted.get_public_key()[32..].try_into().unwrap();
     let verify_key = rns_crypto::ed25519::Ed25519PublicKey::from_bytes(&ed_pub).unwrap();
-    assert!(msg.verify(&verify_key));
-    assert_eq!(msg.hash.unwrap(), mid);
-    assert_eq!(msg.source_hash, lite_source.lxmf_delivery_hash());
+    assert!(msg.verify_signature(&verify_key));
+    assert_eq!(msg.message_id(), mid);
+    assert_eq!(msg.source_hash(), lite_source.lxmf_delivery_hash());
 }
 
 // In-crate ratcheted round-trip: build-to-ratchet -> ring parse; unknown-target fails closed.
@@ -500,6 +516,7 @@ fn ratcheted_roundtrip_reports_ring_index_and_fails_closed_on_unknown() {
         &out[..n],
         lite_source.public_key(),
         &mut scratch,
+        &mut lxmf_lite_core::LxmfFieldScratch::new(),
     )
     .unwrap();
     assert_eq!(which, Some(0));
@@ -527,7 +544,156 @@ fn ratcheted_roundtrip_reports_ring_index_and_fails_closed_on_unknown() {
             &out[..n],
             lite_source.public_key(),
             &mut scratch,
+            &mut lxmf_lite_core::LxmfFieldScratch::new()
         )
         .is_err()
+    );
+}
+
+#[test]
+fn full_width_fields_and_embedded_count_profile_match_trusted_donor() {
+    use lxmf_lite_core::lxmf::{FieldId, field_value, field_value_id};
+    use lxmf_lite_core::{LxmfError, LxmfFieldScratch};
+    let source = LocalIdentity::from_private_key(&SOURCE_PRV);
+    let recipient = LocalIdentity::from_private_key(&RECIPIENT_PRV);
+    let key =
+        rns_crypto::ed25519::Ed25519PrivateKey::from_bytes(&SOURCE_PRV[32..].try_into().unwrap());
+    let make = || {
+        let mut draft = LxMessageDraft::new(
+            recipient.lxmf_delivery_hash(),
+            source.lxmf_delivery_hash(),
+            "",
+            "",
+            DeliveryMethod::Direct,
+        )
+        .unwrap();
+        draft.set_timestamp(TIMESTAMP).unwrap();
+        draft
+    };
+    let mut draft = make();
+    let ids = [
+        i128::from(i64::MIN),
+        -1,
+        0,
+        255,
+        256,
+        0x105,
+        0x10c,
+        i128::from(i64::MAX),
+        i128::from(i64::MAX) + 1,
+        i128::from(u64::MAX),
+    ];
+    for id in ids {
+        draft
+            .set_field(
+                lxmf_core::message::FieldId::try_from(id).unwrap(),
+                vec![0x42],
+            )
+            .unwrap();
+    }
+    let frozen = draft.sign(&key).unwrap().finalize(None).unwrap();
+    let mut scratch = vec![0; frozen.wire_bytes().len()];
+    let mut fields = LxmfFieldScratch::new();
+    let view = lxmf_lite_core::parse_link(
+        &recipient,
+        frozen.wire_bytes(),
+        source.public_key(),
+        &mut scratch,
+        &mut fields,
+    )
+    .unwrap();
+    for id in ids {
+        assert_eq!(
+            field_value_id(view.fields, FieldId::try_from(id).unwrap()),
+            Some(&[0xc4, 1, 0x42][..])
+        );
+    }
+    assert_eq!(field_value(view.fields, 5), None);
+    assert_eq!(field_value(view.fields, 12), None);
+    for count in [64u8, 65] {
+        let mut draft = make();
+        for key in 0..count {
+            draft.set_msgpack_field(key, vec![0xc0]).unwrap();
+        }
+        let frozen = draft.sign(&key).unwrap().finalize(None).unwrap();
+        // Host-valid; admission to the embedded profile is independent of wire validity.
+        assert!(LxMessage::unpack(frozen.wire_bytes()).is_ok());
+        let mut scratch = vec![0; frozen.wire_bytes().len()];
+        let direct = lxmf_lite_core::parse_link(
+            &recipient,
+            frozen.wire_bytes(),
+            source.public_key(),
+            &mut scratch,
+            &mut fields,
+        );
+        assert_eq!(
+            direct.map(|_| ()),
+            if count == 64 {
+                Ok(())
+            } else {
+                Err(LxmfError::TooManyFields)
+            }
+        );
+        let encrypted = trusted_identity(&RECIPIENT_PRV)
+            .encrypt(&frozen.wire_bytes()[16..], None)
+            .unwrap();
+        let mut scratch = [0; MAX_ECIES_PLAINTEXT];
+        let packet = parse_opportunistic(
+            &recipient,
+            &encrypted,
+            source.public_key(),
+            &mut scratch,
+            &mut fields,
+        );
+        assert_eq!(
+            packet.map(|_| ()),
+            if count == 64 {
+                Ok(())
+            } else {
+                Err(LxmfError::TooManyFields)
+            }
+        );
+    }
+}
+
+#[test]
+fn duplicate_full_width_ids_are_rejected_before_signature_at_both_entrypoints() {
+    use lxmf_lite_core::{LxmfError, LxmfFieldScratch};
+    let source = LocalIdentity::from_private_key(&SOURCE_PRV);
+    let recipient = LocalIdentity::from_private_key(&RECIPIENT_PRV);
+    // Raw signed fixture deliberately bypasses the donor's duplicate-preventing draft.
+    let mut packed = trusted_message().wire_bytes().to_vec();
+    assert_eq!(packed.pop(), Some(0x80));
+    packed.extend_from_slice(&[0x82, 1, 0xc0, 0xd1, 0, 1, 0xc0]);
+    let mut signed = packed[..32].to_vec();
+    signed.extend_from_slice(&packed[96..]);
+    let id = rns_crypto::sha::sha256(&signed);
+    signed.extend_from_slice(&id);
+    packed[32..96].copy_from_slice(&source.sign(&signed));
+    let mut fields = LxmfFieldScratch::new();
+    let mut scratch = vec![0; packed.len()];
+    assert_eq!(
+        lxmf_lite_core::parse_link(
+            &recipient,
+            &packed,
+            source.public_key(),
+            &mut scratch,
+            &mut fields
+        ),
+        Err(LxmfError::DuplicateField)
+    );
+    let encrypted = trusted_identity(&RECIPIENT_PRV)
+        .encrypt(&packed[16..], None)
+        .unwrap();
+    let mut scratch = [0; MAX_ECIES_PLAINTEXT];
+    assert_eq!(
+        parse_opportunistic(
+            &recipient,
+            &encrypted,
+            source.public_key(),
+            &mut scratch,
+            &mut fields
+        ),
+        Err(LxmfError::DuplicateField)
     );
 }

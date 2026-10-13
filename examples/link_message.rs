@@ -32,6 +32,7 @@ fn main() {
         &packed[..length],
         source.public_key(),
         &mut parse_scratch,
+        &mut lxmf_lite_core::LxmfFieldScratch::new(),
     )
     .expect("freshly built message validates");
 

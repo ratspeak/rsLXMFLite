@@ -81,6 +81,10 @@ pub enum LxmfError {
     SourceHashMismatch,
     /// Link/resource-delivered message's leading `dest_hash` is not our delivery destination.
     DestinationMismatch,
+    /// More than the embedded profile's 64 outer fields.
+    TooManyFields,
+    /// Repeated numeric outer field key, including alternate integer encodings.
+    DuplicateField,
 }
 
 impl From<CryptoError> for LxmfError {
@@ -163,6 +167,17 @@ fn write_bin<W: PayloadWriter>(writer: &mut W, field: W::Field) -> Result<(), Lx
     writer.field(field)
 }
 
+fn write_fields_header<W: PayloadWriter>(writer: &mut W, count: usize) -> Result<(), LxmfError> {
+    if count > 64 {
+        return Err(LxmfError::TooManyFields);
+    }
+    if count < 16 {
+        writer.write(&[0x80 | count as u8])
+    } else {
+        writer.write(&[0xde, 0, count as u8])
+    }
+}
+
 fn write_payload<W: PayloadWriter>(
     writer: &mut W,
     timestamp: f64,
@@ -174,10 +189,11 @@ fn write_payload<W: PayloadWriter>(
     writer.write(&timestamp.to_be_bytes())?;
     write_bin(writer, title)?;
     write_bin(writer, content)?;
+    write_fields_header(writer, usize::from(audio.is_some()))?;
     if let Some((mode, bytes)) = audio {
         // Donor: lxmf-core AudioFieldRef + native fields-map writer. The value
         // is an array containing an integer and bin, never a bin-wrapped array.
-        writer.write(&[0x81, FIELD_AUDIO, 0x92])?;
+        writer.write(&[FIELD_AUDIO, 0x92])?;
         if mode <= 0x7f {
             writer.write(&[mode])?;
         } else {
@@ -185,7 +201,7 @@ fn write_payload<W: PayloadWriter>(
         }
         write_bin(writer, bytes)
     } else {
-        writer.write(&[0x80])
+        Ok(())
     }
 }
 
@@ -367,6 +383,45 @@ fn read_bin(data: &[u8], pos: usize) -> Result<(&[u8], usize), LxmfError> {
         .ok_or(LxmfError::MalformedPayload)?;
     Ok((&data[start..end], end))
 }
+
+/// Full MessagePack integer domain, adapted from the trusted host FieldId.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct FieldId(i128);
+impl FieldId {
+    pub const fn as_i128(self) -> i128 {
+        self.0
+    }
+    pub fn as_standard(self) -> Option<u8> {
+        u8::try_from(self.0).ok()
+    }
+}
+macro_rules! field_from { ($($t:ty),*) => { $(impl From<$t> for FieldId { fn from(value:$t)->Self { Self(i128::from(value)) } })* }; }
+field_from!(u8, u16, u32, u64, i8, i16, i32, i64);
+impl TryFrom<i128> for FieldId {
+    type Error = LxmfError;
+    fn try_from(value: i128) -> Result<Self, Self::Error> {
+        if value < i128::from(i64::MIN) || value > i128::from(u64::MAX) {
+            return Err(LxmfError::MalformedPayload);
+        }
+        Ok(Self(value))
+    }
+}
+/// Caller-owned reusable outer-field validation workspace; exactly 1 KiB.
+#[derive(Debug)]
+pub struct LxmfFieldScratch {
+    keys: [i128; 64],
+}
+impl LxmfFieldScratch {
+    pub const fn new() -> Self {
+        Self { keys: [0; 64] }
+    }
+}
+impl Default for LxmfFieldScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+const _: () = assert!(core::mem::size_of::<LxmfFieldScratch>() == 1024);
 
 /// A validated, decoded inbound single-frame LXMF message.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -550,13 +605,14 @@ pub fn parse_opportunistic<'a>(
     packet_payload: &[u8],
     source_public_key: &[u8; 64],
     scratch: &'a mut [u8],
+    field_scratch: &mut LxmfFieldScratch,
 ) -> Result<LxmfView<'a>, LxmfError> {
     if scratch.len() < crypto::MAX_ECIES_PLAINTEXT {
         return Err(LxmfError::OutputTooSmall);
     }
     let my_x25519: [u8; 32] = me.private_key()[..32].try_into().unwrap();
     let pt_len = crypto::ecies_decrypt(packet_payload, &my_x25519, me.identity_hash(), scratch)?;
-    parse_decrypted(me, source_public_key, scratch, pt_len)
+    parse_decrypted(me, source_public_key, scratch, pt_len, field_scratch)
 }
 
 /// Like [`parse_opportunistic`] but trying `ratchet_privs` (our retained ring keys, newest first)
@@ -568,6 +624,7 @@ pub fn parse_opportunistic_ratchet<'a>(
     packet_payload: &[u8],
     source_public_key: &[u8; 64],
     scratch: &'a mut [u8],
+    field_scratch: &mut LxmfFieldScratch,
 ) -> Result<(LxmfView<'a>, Option<usize>), LxmfError> {
     if scratch.len() < crypto::MAX_ECIES_PLAINTEXT {
         return Err(LxmfError::OutputTooSmall);
@@ -581,7 +638,7 @@ pub fn parse_opportunistic_ratchet<'a>(
         scratch,
     )?;
     Ok((
-        parse_decrypted(me, source_public_key, scratch, pt_len)?,
+        parse_decrypted(me, source_public_key, scratch, pt_len, field_scratch)?,
         which,
     ))
 }
@@ -601,6 +658,7 @@ pub fn parse_opportunistic_ratchet_hint<'a>(
     packet_payload: &[u8],
     source_public_key: &[u8; 64],
     scratch: &'a mut [u8],
+    field_scratch: &mut LxmfFieldScratch,
 ) -> Result<LxmfView<'a>, LxmfError> {
     if scratch.len() < crypto::MAX_ECIES_PLAINTEXT {
         return Err(LxmfError::OutputTooSmall);
@@ -614,7 +672,7 @@ pub fn parse_opportunistic_ratchet_hint<'a>(
         ratchet_index,
         scratch,
     )?;
-    parse_decrypted(me, source_public_key, scratch, pt_len)
+    parse_decrypted(me, source_public_key, scratch, pt_len, field_scratch)
 }
 
 fn parse_decrypted<'a>(
@@ -622,6 +680,7 @@ fn parse_decrypted<'a>(
     source_public_key: &[u8; 64],
     scratch: &'a [u8],
     pt_len: usize,
+    field_scratch: &mut LxmfFieldScratch,
 ) -> Result<LxmfView<'a>, LxmfError> {
     let plaintext = &scratch[..pt_len];
 
@@ -657,6 +716,7 @@ fn parse_decrypted<'a>(
     let (title, after_title) = read_bin(payload, 10)?;
     let (content, after_content) = read_bin(payload, after_title)?;
     let after_fields = skip_value(payload, after_content, 0)?; // element 4 (fields)
+    validate_fields(&payload[after_content..after_fields], field_scratch)?;
 
     // The 4-element payload used for hashing (Python strips the stamp and re-packs as 4 elements):
     // bytes [0..after_fields] with the array marker forced to 0x94.
@@ -865,6 +925,7 @@ pub fn parse_link<'a>(
     data: &'a [u8],
     source_public_key: &[u8; 64],
     scratch: &mut [u8],
+    field_scratch: &mut LxmfFieldScratch,
 ) -> Result<LxmfView<'a>, LxmfError> {
     if data.len() < LXMF_PACKED_PREFIX + 1 {
         return Err(LxmfError::MalformedPayload);
@@ -901,6 +962,7 @@ pub fn parse_link<'a>(
     let (title, after_title) = read_bin(payload, 10)?;
     let (content, after_content) = read_bin(payload, after_title)?;
     let after_fields = skip_value(payload, after_content, 0)?; // element 4 (fields)
+    validate_fields(&payload[after_content..after_fields], field_scratch)?;
 
     // scratch = dest || source || payload4(marker forced 0x94) || hash; verify over it.
     let p4_len = after_fields;
@@ -933,26 +995,73 @@ pub fn parse_link<'a>(
 
 // ---- fields helpers (lazy decode of the raw `fields` element) ----
 
-/// Raw msgpack value slice for integer key `key` in a fields map (`fields` = the raw
-/// [`LxmfView::fields`] element). `None` if `fields` is not a map, the key is absent, or the
-/// encoding is malformed. Non-integer keys are skipped. The LAST occurrence of a duplicated
-/// key wins (Python dict-decode semantics). Bounded like the internal `skip_value`; each iteration
-/// consumes at least one byte, so the loop is O(len).
+/// Exact encoded value for a standard field ID. Duplicate maps never select a winner.
 pub fn field_value(fields: &[u8], key: u8) -> Option<&[u8]> {
+    field_value_id(fields, key.into())
+}
+/// Full-width extension-field lookup. At most 64 outer keys, with no allocation.
+pub fn field_value_id(fields: &[u8], key: FieldId) -> Option<&[u8]> {
+    validate_fields_without_scratch(fields).ok()?;
     let (mut pos, count) = read_map_header(fields)?;
-    let mut found = None;
     for _ in 0..count {
-        let (k, after_key) = match read_int_key(fields, pos) {
-            Some((k, after)) => (Some(k), after),
-            None => (None, skip_value(fields, pos, 0).ok()?),
-        };
-        let after_value = skip_value(fields, after_key, 0).ok()?;
-        if k == Some(key) {
-            found = Some(&fields[after_key..after_value]);
+        let (id, after_key) = read_field_id(fields, pos)?;
+        let end = skip_value(fields, after_key, 0).ok()?;
+        if id == key {
+            return Some(&fields[after_key..end]);
         }
-        pos = after_value;
+        pos = end;
     }
-    found
+    None
+}
+/// Validate the embedded outer-map profile before authentication/application publication.
+pub fn validate_fields(fields: &[u8], scratch: &mut LxmfFieldScratch) -> Result<(), LxmfError> {
+    let Some((mut pos, count)) = read_map_header(fields) else {
+        return Ok(());
+    };
+    if count > 64 {
+        return Err(LxmfError::TooManyFields);
+    }
+    if count > fields.len().saturating_sub(pos) / 2 {
+        return Err(LxmfError::MalformedPayload);
+    }
+    for index in 0..count {
+        let (key, after_key) = read_field_id(fields, pos).ok_or(LxmfError::MalformedPayload)?;
+        if scratch.keys[..index].contains(&key.0) {
+            return Err(LxmfError::DuplicateField);
+        }
+        scratch.keys[index] = key.0;
+        pos = skip_value(fields, after_key, 0)?;
+    }
+    if pos != fields.len() {
+        return Err(LxmfError::MalformedPayload);
+    }
+    Ok(())
+}
+// Standalone lazy helpers cannot trust that callers obtained their slice from a
+// validated LxmfView. Bound comparisons to 2,016 pairs without stacking 1 KiB.
+fn validate_fields_without_scratch(fields: &[u8]) -> Result<(), LxmfError> {
+    let (first, count) = read_map_header(fields).ok_or(LxmfError::MalformedPayload)?;
+    if count > 64 {
+        return Err(LxmfError::TooManyFields);
+    }
+    let mut pos = first;
+    for index in 0..count {
+        let (key, after_key) = read_field_id(fields, pos).ok_or(LxmfError::MalformedPayload)?;
+        let mut prior = first;
+        for _ in 0..index {
+            let (previous, end) =
+                read_field_id(fields, prior).ok_or(LxmfError::MalformedPayload)?;
+            if previous == key {
+                return Err(LxmfError::DuplicateField);
+            }
+            prior = skip_value(fields, end, 0)?;
+        }
+        pos = skip_value(fields, after_key, 0)?;
+    }
+    if pos != fields.len() {
+        return Err(LxmfError::MalformedPayload);
+    }
+    Ok(())
 }
 
 /// Inspect a native audio field in an authenticated message's fields map.
@@ -961,24 +1070,13 @@ pub fn field_value(fields: &[u8], key: u8) -> Option<&[u8]> {
 /// `[integer in 0..=255, binary]`, with no trailing bytes. Unknown modes remain
 /// inspectable for unsupported-media UI; valid framing does not mean decodable
 /// audio. A malformed field does not change authentication of its enclosing
-/// message. Duplicate keys use the last value, matching the full Rust map.
+/// message. Duplicate outer keys are rejected before any native-field interpretation.
 /// Recursion and traversal remain bounded by the supplied map slice.
 pub fn audio_field(fields: &[u8]) -> Result<Option<AudioField<'_>>, LxmfError> {
-    let (mut pos, count) = read_map_header(fields).ok_or(LxmfError::MalformedPayload)?;
-    let mut found = None;
-    for _ in 0..count {
-        let after_key = skip_value(fields, pos, 0)?;
-        let key = read_audio_integer(&fields[pos..after_key]).map(|(value, _)| value);
-        let after_value = skip_value(fields, after_key, 0)?;
-        if key == Some(FIELD_AUDIO) {
-            found = Some(&fields[after_key..after_value]);
-        }
-        pos = after_value;
-    }
-    if pos != fields.len() {
-        return Err(LxmfError::MalformedPayload);
-    }
-    let Some(value) = found else { return Ok(None) };
+    validate_fields_without_scratch(fields)?;
+    let Some(value) = field_value(fields, FIELD_AUDIO) else {
+        return Ok(None);
+    };
     let array_header = match value {
         [0x92, ..] => 1,
         [0xdc, 0, 2, ..] => 3,
@@ -1022,26 +1120,55 @@ pub fn value_as_bytes(value: &[u8]) -> Option<&[u8]> {
     read_bin(value, 0).ok().map(|(b, _)| b)
 }
 
-/// Raw msgpack value slice for `bin`/`str` key `key` in a msgpack map (e.g. a fields value
-/// that is itself an encoded map). Same bounds/tolerance as [`field_value`].
+/// Raw value for an exact UTF-8 text key in a recognized structured field.
+///
+/// Validate all keys before interpreting any member. Positive signed/unsigned
+/// integer keys normalize; invalid UTF-8, other key types, duplicates and trailing
+/// bytes invalidate this optional interpretation. The embedded schema profile
+/// permits at most 64 entries (2,016 comparisons), without allocating or placing
+/// another 1 KiB scratch on the stack. Unknown nested values remain opaque.
 pub fn map_bytes_value<'a>(map: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
-    let (mut pos, count) = read_map_header(map)?;
-    for _ in 0..count {
-        match read_bin(map, pos) {
-            Ok((k, after_key)) => {
-                let after_value = skip_value(map, after_key, 0).ok()?;
-                if k == key {
-                    return Some(&map[after_key..after_value]);
-                }
-                pos = after_value;
-            }
-            Err(_) => {
-                let after_key = skip_value(map, pos, 0).ok()?;
-                pos = skip_value(map, after_key, 0).ok()?;
-            }
-        }
+    let wanted = core::str::from_utf8(key).ok()?;
+    let (first, count) = read_map_header(map)?;
+    if count > 64 || count > map.len().saturating_sub(first) / 2 {
+        return None;
     }
-    None
+    let mut pos = first;
+    let mut found = None;
+    for index in 0..count {
+        let (current, after_key) = read_schema_key(map, pos)?;
+        let mut prior = first;
+        for _ in 0..index {
+            let (previous, end) = read_schema_key(map, prior)?;
+            if previous == current {
+                return None;
+            }
+            prior = skip_value(map, end, 0).ok()?;
+        }
+        let end = skip_value(map, after_key, 0).ok()?;
+        if current == SchemaKey::Text(wanted) {
+            found = Some(&map[after_key..end]);
+        }
+        pos = end;
+    }
+    if pos != map.len() {
+        return None;
+    }
+    found
+}
+#[derive(PartialEq)]
+enum SchemaKey<'a> {
+    Integer(FieldId),
+    Text(&'a str),
+}
+fn read_schema_key(map: &[u8], pos: usize) -> Option<(SchemaKey<'_>, usize)> {
+    if matches!(*map.get(pos)?, 0xa0..=0xbf | 0xd9..=0xdb) {
+        let (bytes, end) = read_bin(map, pos).ok()?;
+        Some((SchemaKey::Text(core::str::from_utf8(bytes).ok()?), end))
+    } else {
+        let (id, end) = read_field_id(map, pos)?;
+        Some((SchemaKey::Integer(id), end))
+    }
 }
 
 /// `(first_entry_pos, entry_count)` of a msgpack map at the start of `data`.
@@ -1058,27 +1185,34 @@ fn read_map_header(data: &[u8]) -> Option<(usize, usize)> {
     }
 }
 
-/// A u8-range msgpack integer at `pos` — every encoding a conformant packer can produce
-/// for an LXMF field key: positive fixint, uint8, non-negative int8, and 16-bit forms
-/// whose value fits u8. Negative values are never valid field keys (deliberately unlike
-/// the micro C++ filter's historical raw `>= 0xE0` branch, which misread msgpack negative
-/// fixints as u8 keys).
-fn read_int_key(data: &[u8], pos: usize) -> Option<(u8, usize)> {
-    let b = *data.get(pos)?;
-    match b {
-        0x00..=0x7f => Some((b, pos + 1)),
-        0xcc => data.get(pos + 1).map(|&v| (v, pos + 2)),
-        0xd0 => data
-            .get(pos + 1)
-            .filter(|&&v| v <= 0x7f)
-            .map(|&v| (v, pos + 2)),
-        0xcd | 0xd1 => {
-            let hi = *data.get(pos + 1)?;
-            let lo = *data.get(pos + 2)?;
-            (hi == 0).then_some((lo, pos + 3))
-        }
-        _ => None,
+// Full signed/unsigned integer decoding mirrors trusted host read_msgpack_integer.
+fn read_field_id(data: &[u8], pos: usize) -> Option<(FieldId, usize)> {
+    let marker = *data.get(pos)?;
+    let (width, signed) = match marker {
+        0x00..=0x7f => return Some((FieldId::from(marker), pos + 1)),
+        0xe0..=0xff => return Some((FieldId::from(marker as i8), pos + 1)),
+        0xcc => (1, false),
+        0xcd => (2, false),
+        0xce => (4, false),
+        0xcf => (8, false),
+        0xd0 => (1, true),
+        0xd1 => (2, true),
+        0xd2 => (4, true),
+        0xd3 => (8, true),
+        _ => return None,
+    };
+    let start = pos.checked_add(1)?;
+    let end = start.checked_add(width)?;
+    let bytes = data.get(start..end)?;
+    let mut value = if signed && bytes[0] & 0x80 != 0 {
+        -1i128
+    } else {
+        0
+    };
+    for byte in bytes {
+        value = (value << 8) | i128::from(*byte);
     }
+    Some((FieldId::try_from(value).ok()?, end))
 }
 
 #[cfg(test)]
@@ -1094,16 +1228,13 @@ mod tests {
     }
 
     #[test]
-    fn field_value_decodes_all_u8_key_encodings_last_wins() {
+    fn field_value_rejects_duplicate_numeric_encodings() {
         // {0x40(fixint): 1, 0xFB(uint8): "a", 0xFB(int16, 0xd1 00 fb): "b"} — last wins.
         let fields: &[u8] = &[
             0x83, 0x40, 0x01, 0xcc, 0xfb, 0xa1, b'a', 0xd1, 0x00, 0xfb, 0xa1, b'b',
         ];
-        assert_eq!(field_value(fields, 0x40), Some(&[0x01u8][..]));
-        assert_eq!(
-            field_value(fields, 0xfb).and_then(value_as_bytes),
-            Some(&b"b"[..])
-        );
+        assert_eq!(field_value(fields, 0x40), None);
+        assert_eq!(field_value(fields, 0xfb).and_then(value_as_bytes), None);
         // int8 (0xd0) non-negative decodes; negative int8 and negative fixint keys never match.
         let d0: &[u8] = &[0x81, 0xd0, 0x30, 0xc0];
         assert_eq!(field_value(d0, 0x30), Some(&[0xc0u8][..]));
@@ -1150,8 +1281,14 @@ mod tests {
         assert_eq!(dest, recipient.lxmf_delivery_hash());
 
         let mut scratch = [0u8; crypto::MAX_ECIES_PLAINTEXT];
-        let view =
-            parse_opportunistic(&recipient, &out[..n], source.public_key(), &mut scratch).unwrap();
+        let view = parse_opportunistic(
+            &recipient,
+            &out[..n],
+            source.public_key(),
+            &mut scratch,
+            &mut LxmfFieldScratch::new(),
+        )
+        .unwrap();
         assert_eq!(view.message_id, mid);
         assert_eq!(view.timestamp, 1234567890.5);
         assert_eq!(view.title, b"Hi");
@@ -1238,8 +1375,14 @@ mod tests {
         let recipient = LocalIdentity::from_private_key(&id64(RECIPIENT_PRV));
         let blob = unhex(PYTHON_BLOB);
         let mut scratch = [0u8; crypto::MAX_ECIES_PLAINTEXT];
-        let view =
-            parse_opportunistic(&recipient, &blob, source.public_key(), &mut scratch).unwrap();
+        let view = parse_opportunistic(
+            &recipient,
+            &blob,
+            source.public_key(),
+            &mut scratch,
+            &mut LxmfFieldScratch::new(),
+        )
+        .unwrap();
         assert_eq!(view.title, b"Hi");
         assert_eq!(view.content, b"hello world");
         assert_eq!(view.message_id, unhex(MESSAGE_ID)[..]);
@@ -1271,7 +1414,13 @@ mod tests {
         let wrong = LocalIdentity::from_private_key(&[0x09u8; 64]);
         let mut scratch = [0u8; crypto::MAX_ECIES_PLAINTEXT];
         assert_eq!(
-            parse_opportunistic(&recipient, &out[..n], wrong.public_key(), &mut scratch),
+            parse_opportunistic(
+                &recipient,
+                &out[..n],
+                wrong.public_key(),
+                &mut scratch,
+                &mut LxmfFieldScratch::new()
+            ),
             Err(LxmfError::SourceHashMismatch)
         );
     }
@@ -1385,7 +1534,14 @@ mod tests {
         assert_eq!(dest, recipient.lxmf_delivery_hash());
         assert_eq!(&out[..16], &dest);
 
-        let view = parse_link(&recipient, &out[..n], source.public_key(), &mut scratch).unwrap();
+        let view = parse_link(
+            &recipient,
+            &out[..n],
+            source.public_key(),
+            &mut scratch,
+            &mut LxmfFieldScratch::new(),
+        )
+        .unwrap();
         assert_eq!(view.message_id, mid);
         assert_eq!(view.title, b"Hi");
         assert_eq!(view.content, &content[..]);
@@ -1394,7 +1550,13 @@ mod tests {
         // Wrong recipient -> DestinationMismatch (never validated).
         let wrong = LocalIdentity::from_private_key(&[0x09u8; 64]);
         assert_eq!(
-            parse_link(&wrong, &out[..n], source.public_key(), &mut scratch),
+            parse_link(
+                &wrong,
+                &out[..n],
+                source.public_key(),
+                &mut scratch,
+                &mut LxmfFieldScratch::new()
+            ),
             Err(LxmfError::DestinationMismatch)
         );
         // Tampered signature -> SignatureInvalid.
@@ -1402,7 +1564,13 @@ mod tests {
         bad[..n].copy_from_slice(&out[..n]);
         bad[40] ^= 0x01;
         assert_eq!(
-            parse_link(&recipient, &bad[..n], source.public_key(), &mut scratch),
+            parse_link(
+                &recipient,
+                &bad[..n],
+                source.public_key(),
+                &mut scratch,
+                &mut LxmfFieldScratch::new()
+            ),
             Err(LxmfError::SignatureInvalid)
         );
 
@@ -1499,6 +1667,55 @@ mod tests {
             if let Ok(end) = skip_value(&one, 0, 0) {
                 assert!(end <= one.len());
             }
+        }
+    }
+    #[test]
+    fn embedded_field_profile_writer_and_depth_limits() {
+        let mut output = [0xa5; 140];
+        let mut writer = SliceWriter {
+            output: &mut output,
+            position: 0,
+        };
+        write_fields_header(&mut writer, 64).unwrap();
+        for key in 0..64 {
+            writer.write(&[key, 0xc0]).unwrap();
+        }
+        let len = writer.position;
+        assert_eq!(
+            validate_fields(&output[..len], &mut LxmfFieldScratch::new()),
+            Ok(())
+        );
+        let before = output;
+        let mut writer = SliceWriter {
+            output: &mut output,
+            position: 0,
+        };
+        assert_eq!(
+            write_fields_header(&mut writer, 65),
+            Err(LxmfError::TooManyFields)
+        );
+        assert_eq!(writer.position, 0);
+        assert_eq!(output, before);
+        for depth in [8, 9] {
+            let mut nested = std::vec![0x91; depth];
+            nested.push(0xc0);
+            assert_eq!(skip_value(&nested, 0, 0).is_ok(), depth == 8);
+        }
+    }
+    #[test]
+    fn structured_maps_reject_all_ambiguous_schema_keys() {
+        assert_eq!(
+            map_bytes_value(&[0x81, 0xa1, b'e', 1], b"e"),
+            Some(&[1][..])
+        );
+        for map in [
+            &b"\x82\xa1e\x01\xa1e\x02"[..],
+            &b"\x83\xa1e\x01\x01\xc0\xcc\x01\xc0"[..],
+            &b"\x82\xa1e\x01\xc4\x01e\x02"[..],
+            &b"\x82\xa1e\x01\xa1\xff\xc0"[..],
+            &b"\x81\xa1e\x01\xc0"[..],
+        ] {
+            assert_eq!(map_bytes_value(map, b"e"), None);
         }
     }
 }

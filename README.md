@@ -21,7 +21,13 @@ encrypt and wrap relay uploads, and decrypt retrieved entries for the ordinary
 message validator. Relay selection and durable inbox acknowledgement remain
 the firmware's responsibility.
 
-Incoming message fields can be read without allocation. The Link/Resource audio
+Incoming message fields can be read without allocation. Full-width signed and
+unsigned integer IDs are preserved; duplicate outer IDs are rejected. Parsers
+require caller-owned `LxmfFieldScratch` (1 KiB), with a maximum of 64 outer
+fields and the existing nesting limit of 8. Standard structured-map readers also
+limit interpretation to 64 unique keys; malformed optional fields do not affect
+the preserved message bytes. Host profiles can be larger, so a valid host message
+is not automatically compatible with firmware. The Link/Resource audio
 builder writes standard LXMF `[mode, binary]` audio fields covered by the message
 signature; text and opportunistic builders retain empty fields. Audio framing is
 separate from codec support, playback and application size/duration limits.
@@ -35,7 +41,9 @@ and does not support compression.
 ## Build and test
 
 Install Rust through `rustup`; the repository selects Rust 1.87 and the
-bare-metal check targets. These repositories must be siblings:
+bare-metal check targets for production. Install current stable Rust (1.89 or
+newer) for host tests against the full Rust donor crates. The matrix explicitly
+separates these toolchains. These repositories must be siblings:
 
 ```sh
 git clone https://github.com/ratspeak/rsLXMFLite.git

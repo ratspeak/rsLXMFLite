@@ -1,6 +1,9 @@
 //! Native audio fields adapted from the trusted full Rust message codec.
 //! These tests qualify signed wire/container behavior, not audio decoding.
-use lxmf_core::{constants::DeliveryMethod, message::LxMessage};
+use lxmf_core::{
+    constants::DeliveryMethod,
+    message::{LxMessage, LxMessageDraft, RecipientStamp},
+};
 use lxmf_lite_core::{
     AM_CODEC2_700C, AudioField, FIELD_AUDIO, LxmfError, audio_field, build_link_with_audio,
     packed_len_with_audio, parse_link,
@@ -14,24 +17,30 @@ fn identities() -> (LocalIdentity, LocalIdentity) {
         LocalIdentity::from_private_key(&[0x52; 64]),
     )
 }
-fn trusted(mode: u8, bytes: &[u8]) -> LxMessage {
+fn trusted_draft(mode: u8, bytes: &[u8]) -> LxMessageDraft {
     let (source, recipient) = identities();
-    let mut message = LxMessage::new(
+    let mut message = LxMessageDraft::new(
         recipient.lxmf_delivery_hash(),
         source.lxmf_delivery_hash(),
         "",
         "Voice message",
         DeliveryMethod::Direct,
-    );
-    message.timestamp = 1234567890.5;
+    )
+    .unwrap();
+    message.set_timestamp(1234567890.5).unwrap();
     message.set_audio_field(mode, bytes).unwrap();
     message
+}
+fn trusted(mode: u8, bytes: &[u8]) -> LxMessage {
+    trusted_draft(mode, bytes)
         .sign(&rns_crypto::ed25519::Ed25519PrivateKey::from_bytes(
             &[0x51; 32],
         ))
-        .unwrap();
-    message
+        .unwrap()
+        .finalize(None)
+        .unwrap()
 }
+
 fn build(
     mode: u8,
     bytes: &[u8],
@@ -71,8 +80,15 @@ fn signed_audio_is_byte_exact_with_full_rust_and_borrows_payload() {
             let (n, id) = build(mode, &bytes, &mut out, &mut scratch).unwrap();
             assert_eq!(n, size);
             assert_eq!(reference.pack().unwrap(), out);
-            assert_eq!(reference.hash.unwrap(), id);
-            let view = parse_link(&recipient, &out, source.public_key(), &mut scratch).unwrap();
+            assert_eq!(reference.message_id(), id);
+            let view = parse_link(
+                &recipient,
+                &out,
+                source.public_key(),
+                &mut scratch,
+                &mut lxmf_lite_core::LxmfFieldScratch::new(),
+            )
+            .unwrap();
             let field = audio_field(view.fields).unwrap().unwrap();
             assert_eq!(
                 field,
@@ -85,15 +101,21 @@ fn signed_audio_is_byte_exact_with_full_rust_and_borrows_payload() {
             let borrowed = field.bytes.as_ptr() as usize;
             assert!(borrowed >= start && borrowed + len <= start + out.len());
             assert_eq!(view.message_id, id);
-            let mut unpacked = LxMessage::unpack(&out).unwrap();
+            let unpacked = LxMessage::unpack(&out).unwrap();
             let key = rns_crypto::ed25519::Ed25519PrivateKey::from_bytes(&[0x51; 32]);
-            assert!(unpacked.verify(&key.public_key()));
+            assert!(unpacked.verify_signature(&key.public_key()));
             assert_eq!(unpacked.audio_field().unwrap().unwrap().bytes, bytes);
             if len != 0 {
                 let offset = borrowed - start;
                 out[offset] ^= 0x80;
                 assert!(matches!(
-                    parse_link(&recipient, &out, source.public_key(), &mut scratch),
+                    parse_link(
+                        &recipient,
+                        &out,
+                        source.public_key(),
+                        &mut scratch,
+                        &mut lxmf_lite_core::LxmfFieldScratch::new()
+                    ),
                     Err(LxmfError::SignatureInvalid)
                 ));
             }
@@ -114,8 +136,13 @@ fn stamped_propagation_retains_audio_and_the_authenticated_id() {
             let (n, id) = build(AM_CODEC2_700C, &bytes, &mut buffer, &mut scratch).unwrap();
             let stamp = vec![0x72; stamp_len];
             let n = append_recipient_stamp(&mut buffer, n, &stamp).unwrap();
-            let mut reference = trusted(AM_CODEC2_700C, &bytes);
-            reference.stamp = Some(stamp);
+            let reference = trusted_draft(AM_CODEC2_700C, &bytes)
+                .sign(&rns_crypto::ed25519::Ed25519PrivateKey::from_bytes(
+                    &[0x51; 32],
+                ))
+                .unwrap()
+                .finalize(RecipientStamp::from_bytes(&stamp))
+                .unwrap();
             assert_eq!(&buffer[..n], reference.pack().unwrap());
             let signed = buffer[..n].to_vec();
             let (encrypted_len, tid) = encrypt_message(
@@ -152,6 +179,7 @@ fn stamped_propagation_retains_audio_and_the_authenticated_id() {
                 &restored[..n],
                 source.public_key(),
                 &mut scratch,
+                &mut lxmf_lite_core::LxmfFieldScratch::new(),
             )
             .unwrap();
             assert_eq!(view.message_id, id);
@@ -173,16 +201,25 @@ fn malformed_audio_is_separate_from_message_authentication() {
         vec![0x92, 3, 0xc0],             // nil data
         vec![0x92, 3, 0x90],             // array instead of binary
     ] {
-        let mut message = trusted(3, b"test");
-        message.fields.insert(FIELD_AUDIO, value);
-        message
+        let mut message = trusted_draft(3, b"test");
+        message.set_msgpack_field(FIELD_AUDIO, value).unwrap();
+        let message = message
             .sign(&rns_crypto::ed25519::Ed25519PrivateKey::from_bytes(
                 &[0x51; 32],
             ))
+            .unwrap()
+            .finalize(None)
             .unwrap();
         let packed = message.pack().unwrap();
         let mut scratch = vec![0; packed.len()];
-        let view = parse_link(&recipient, &packed, source.public_key(), &mut scratch).unwrap();
+        let view = parse_link(
+            &recipient,
+            &packed,
+            source.public_key(),
+            &mut scratch,
+            &mut lxmf_lite_core::LxmfFieldScratch::new(),
+        )
+        .unwrap();
         assert!(audio_field(view.fields).is_err());
         assert!(message.audio_field().is_err());
     }
@@ -193,16 +230,8 @@ fn strict_audio_map_handles_truncation_duplicate_keys_and_integer_encodings() {
     assert_eq!(audio_field(&[0x80]), Ok(None));
     assert!(audio_field(&[0x80, 0]).is_err());
     assert!(audio_field(&[0x90]).is_err());
-    // Last occurrence wins, including a malformed last field.
-    assert_eq!(
-        audio_field(&[0x82, 7, 0xc0, 7, 0x92, 3, 0xc4, 1, 0x42])
-            .unwrap()
-            .unwrap(),
-        AudioField {
-            mode: 3,
-            bytes: &[0x42]
-        }
-    );
+    // Duplicate outer keys are ambiguous even when both values parse.
+    assert!(audio_field(&[0x82, 7, 0xc0, 7, 0x92, 3, 0xc4, 1, 0x42]).is_err());
     assert!(audio_field(&[0x82, 7, 0x92, 3, 0xc4, 1, 0x42, 7, 0xc0]).is_err());
     for integer in [
         vec![3],
@@ -273,7 +302,14 @@ fn signed_container_matches_pinned_python_fixture() {
     let (n, id) = build(AM_CODEC2_700C, &bytes, &mut output, &mut scratch).unwrap();
     assert_eq!(&output[..n], expected);
     let (source, recipient) = identities();
-    let parsed = parse_link(&recipient, expected, source.public_key(), &mut scratch).unwrap();
+    let parsed = parse_link(
+        &recipient,
+        expected,
+        source.public_key(),
+        &mut scratch,
+        &mut lxmf_lite_core::LxmfFieldScratch::new(),
+    )
+    .unwrap();
     assert_eq!(parsed.message_id, id);
     assert_eq!(
         audio_field(parsed.fields).unwrap().unwrap(),
