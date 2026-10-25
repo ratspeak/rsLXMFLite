@@ -111,6 +111,42 @@ fn exact_size_and_direct_wire_match_trusted_encoder() {
     }
 }
 
+// The single-frame capacity is LXMF 1.2.0's opportunistic limit (LXMessage.py:64-79): content the
+// trusted router keeps opportunistic fits one packet, and one byte more falls back to direct.
+#[test]
+fn single_frame_capacity_is_the_trusted_opportunistic_limit() {
+    use lxmf_core::constants::{ENCRYPTED_PACKET_MAX_CONTENT, STRUCT_OVERHEAD, TIMESTAMP_SIZE};
+    use lxmf_lite_core::MAX_LXMF_PAYLOAD;
+
+    assert_eq!(
+        MAX_LXMF_PAYLOAD,
+        ENCRYPTED_PACKET_MAX_CONTENT + TIMESTAMP_SIZE + STRUCT_OVERHEAD
+    );
+    let source = LocalIdentity::from_private_key(&SOURCE_PRV);
+    let recipient = LocalIdentity::from_private_key(&RECIPIENT_PRV);
+    for (content_size, fits) in [
+        (ENCRYPTED_PACKET_MAX_CONTENT, true),
+        (ENCRYPTED_PACKET_MAX_CONTENT + 1, false),
+    ] {
+        // With an empty title and no fields, Python's content size is the content length.
+        let content = vec![b'x'; content_size];
+        let mut out = [0u8; rns_lite_core::constants::MDU];
+        let built = build_opportunistic(
+            &source,
+            recipient.public_key(),
+            TIMESTAMP,
+            b"",
+            &content,
+            &[0x31; 32],
+            &[0x32; 16],
+            &mut out,
+            &mut [0; 16],
+            &mut [0; 32],
+        );
+        assert_eq!(built.is_ok(), fits, "{content_size} bytes");
+    }
+}
+
 // The lite plaintext builder must be byte-identical to the trusted lxmf-core pack()
 // (same msgpack payload, hash, and deterministic Ed25519 signature).
 #[test]
