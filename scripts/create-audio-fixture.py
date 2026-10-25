@@ -17,8 +17,8 @@ parser.add_argument('--lxmf', type=Path, required=True)
 args = parser.parse_args()
 refs = {}
 for name, directory, expected in [
-    ('Reticulum', args.rns, 'b48b96e61676504e0a4e527b33b9a0b4495c6872'),
-    ('LXMF', args.lxmf, 'a29c4a0e17c55a4556b0c772c9d080d479d99ae8'),
+    ('Reticulum', args.rns, '7f2b3b9b524c9386316379af1313b43a5e4f7a5d'),
+    ('LXMF', args.lxmf, 'c3ff2d6dc2f256daab896dadc044dd5a913ecbb7'),
 ]:
     head = subprocess.check_output(['git', '-C', str(directory), 'rev-parse', 'HEAD'], text=True).strip()
     if head != expected:
