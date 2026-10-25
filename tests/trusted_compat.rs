@@ -116,7 +116,7 @@ fn exact_size_and_direct_wire_match_trusted_encoder() {
 #[test]
 fn single_frame_capacity_is_the_trusted_opportunistic_limit() {
     use lxmf_core::constants::{ENCRYPTED_PACKET_MAX_CONTENT, STRUCT_OVERHEAD, TIMESTAMP_SIZE};
-    use lxmf_lite_core::MAX_LXMF_PAYLOAD;
+    use lxmf_lite_core::{LxmfError, MAX_LXMF_PAYLOAD};
 
     assert_eq!(
         MAX_LXMF_PAYLOAD,
@@ -143,7 +143,11 @@ fn single_frame_capacity_is_the_trusted_opportunistic_limit() {
             &mut [0; 16],
             &mut [0; 32],
         );
-        assert_eq!(built.is_ok(), fits, "{content_size} bytes");
+        if fits {
+            assert!(built.is_ok(), "{content_size} bytes");
+        } else {
+            assert_eq!(built, Err(LxmfError::TooLong), "{content_size} bytes");
+        }
     }
 }
 

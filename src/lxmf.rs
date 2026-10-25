@@ -462,9 +462,13 @@ fn build_plaintext(
     let dest_hash = destination_hash_from_parts(&nh, Some(&recipient_id_hash));
     let source_hash = source.lxmf_delivery_hash();
 
-    // payload = msgpack([timestamp, title, content, {}])
+    // payload = msgpack([timestamp, title, content, {}]); its buffer is the single-frame bound.
     let mut payload = [0u8; MAX_LXMF_PAYLOAD];
-    let plen = pack_payload(timestamp, title, content, &mut payload)?;
+    let plen =
+        pack_payload(timestamp, title, content, &mut payload).map_err(|error| match error {
+            LxmfError::OutputTooSmall => LxmfError::TooLong,
+            other => other,
+        })?;
 
     // hashed_part = dest || source || payload -> hash (= message_id); signed_part = hashed_part || hash
     let mut signed = [0u8; LXMF_DEST_LENGTH * 2 + MAX_LXMF_PAYLOAD + MESSAGE_ID_LENGTH];
@@ -1225,6 +1229,34 @@ mod tests {
             *b = i as u8;
         }
         k
+    }
+
+    #[test]
+    fn content_past_one_frame_is_too_long_not_a_short_buffer() {
+        // The single-frame limit the caller falls back from is TooLong; OutputTooSmall stays the
+        // caller's own buffer.
+        let source = LocalIdentity::from_private_key(&incrementing_key());
+        let recipient = *source.public_key();
+        let fits = [b'x'; MAX_LXMF_PAYLOAD - 16];
+        let over = [b'x'; MAX_LXMF_PAYLOAD - 15];
+        let build = |content: &[u8], out: &mut [u8]| {
+            build_opportunistic(
+                &source,
+                &recipient,
+                1.0,
+                b"",
+                content,
+                &[1; 32],
+                &[2; 16],
+                out,
+                &mut [0; 16],
+                &mut [0; 32],
+            )
+        };
+        let mut out = [0u8; 600];
+        assert!(build(&fits, &mut out).is_ok());
+        assert_eq!(build(&over, &mut out), Err(LxmfError::TooLong));
+        assert_eq!(build(&fits, &mut out[..8]), Err(LxmfError::OutputTooSmall));
     }
 
     #[test]
