@@ -614,8 +614,8 @@ pub fn parse_opportunistic<'a>(
     if scratch.len() < crypto::MAX_ECIES_PLAINTEXT {
         return Err(LxmfError::OutputTooSmall);
     }
-    let my_x25519: [u8; 32] = me.private_key()[..32].try_into().unwrap();
-    let pt_len = crypto::ecies_decrypt(packet_payload, &my_x25519, me.identity_hash(), scratch)?;
+    let my_x25519: &[u8; 32] = me.private_key()[..32].try_into().unwrap();
+    let pt_len = crypto::ecies_decrypt(packet_payload, my_x25519, me.identity_hash(), scratch)?;
     parse_decrypted(me, source_public_key, scratch, pt_len, field_scratch)
 }
 
@@ -633,11 +633,11 @@ pub fn parse_opportunistic_ratchet<'a>(
     if scratch.len() < crypto::MAX_ECIES_PLAINTEXT {
         return Err(LxmfError::OutputTooSmall);
     }
-    let my_x25519: [u8; 32] = me.private_key()[..32].try_into().unwrap();
+    let my_x25519: &[u8; 32] = me.private_key()[..32].try_into().unwrap();
     let (pt_len, which) = crypto::ecies_decrypt_with_ratchets(
         packet_payload,
         ratchet_privs,
-        &my_x25519,
+        my_x25519,
         me.identity_hash(),
         scratch,
     )?;
@@ -667,11 +667,11 @@ pub fn parse_opportunistic_ratchet_hint<'a>(
     if scratch.len() < crypto::MAX_ECIES_PLAINTEXT {
         return Err(LxmfError::OutputTooSmall);
     }
-    let my_x25519: [u8; 32] = me.private_key()[..32].try_into().unwrap();
+    let my_x25519: &[u8; 32] = me.private_key()[..32].try_into().unwrap();
     let pt_len = crypto::ecies_decrypt_with_ratchet_hint(
         packet_payload,
         ratchet_privs,
-        &my_x25519,
+        my_x25519,
         me.identity_hash(),
         ratchet_index,
         scratch,
@@ -785,11 +785,11 @@ pub fn peek_source_opportunistic_ratchet(
     if scratch.len() < crypto::MAX_ECIES_PLAINTEXT {
         return Err(LxmfError::OutputTooSmall);
     }
-    let my_x25519: [u8; 32] = me.private_key()[..32].try_into().unwrap();
+    let my_x25519: &[u8; 32] = me.private_key()[..32].try_into().unwrap();
     let (pt_len, which) = crypto::ecies_decrypt_with_ratchets(
         packet_payload,
         ratchet_privs,
-        &my_x25519,
+        my_x25519,
         me.identity_hash(),
         scratch,
     )?;

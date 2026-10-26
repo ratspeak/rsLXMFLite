@@ -374,10 +374,10 @@ pub fn decrypt_message(
         return Err(LxmfError::DestinationMismatch);
     }
     let transient_id = Sha256::digest(&*buffer).into();
-    let base: [u8; 32] = me.private_key()[..32].try_into().unwrap();
+    let base: &[u8; 32] = me.private_key()[..32].try_into().unwrap();
     for (index, key) in ratchet_privs
         .iter()
-        .chain(core::iter::once(&base))
+        .chain(core::iter::once(base))
         .enumerate()
     {
         if let Ok(n) = crypto::ecies_decrypt_in_place(key, me.identity_hash(), &mut buffer[16..]) {
