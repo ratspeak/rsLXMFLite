@@ -1,9 +1,9 @@
 //! Bounded LXMF message construction and validation for MCU firmware.
 //!
 //! This crate is unconditionally `no_std` and allocation-free. It owns the
-//! message codec only; transport routing, Link sessions, timers, entropy,
-//! persistence, and interface I/O remain responsibilities of the embedding
-//! runtime and [`rns_lite_core`].
+//! message and propagation-client codecs and resumable stamp work; transport
+//! routing, Link sessions, timers, entropy, persistence and interface I/O remain
+//! responsibilities of the embedding runtime and [`rns_lite_core`].
 
 #![no_std]
 #![forbid(unsafe_code)]

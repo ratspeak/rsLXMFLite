@@ -1,7 +1,7 @@
 //! Resumable LXMF proof of work adapted from `lxmf-core::stamper`.
 //!
 //! Stream the trusted workblock's HKDF chunks into an unfinalized SHA-256 state,
-//! instead of retaining 256–768 KiB of workblock. Each candidate clones that
+//! instead of retaining up to 768,000 workblock bytes. Each candidate clones that
 //! state, preserving its byte count and the exact `SHA256(workblock || stamp)`.
 //! The caller owns scheduling, wall-clock limits and entropy; no call searches
 //! indefinitely or allocates. Work budgets are operation counts, not durations.
@@ -130,7 +130,8 @@ impl StampSearch {
     /// `seed` must be 32 fresh bytes from the caller's cryptographic RNG. The
     /// search visits distinct successive 256-bit nonces from that random start.
     /// Material is the message ID (recipient stamp) or transient ID (PN stamp).
-    /// Cost zero completes immediately, retaining the required 32-byte stamp.
+    /// Cost zero completes immediately with an all-zero stamp and reported value
+    /// zero, without preparing or hashing a workblock. The seed is unused then.
     pub fn new(
         material: [u8; 32],
         kind: StampKind,

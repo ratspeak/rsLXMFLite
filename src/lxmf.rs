@@ -1,6 +1,6 @@
 //! LXMF opportunistic and packed Link/Resource message codec — `no_std`, no-alloc.
 //!
-//! Faithful to Python LXMF `LXMessage` and rsLXMF `lxmf-core`. The plaintext LXMF message is:
+//! Adapted from rsLXMF `lxmf-core`. The plaintext LXMF message is:
 //!
 //! ```text
 //! packed   = dest_hash(16) || source_hash(16) || signature(64) || msgpack([ts, title, content, fields])
@@ -10,24 +10,28 @@
 //!
 //! `dest_hash`/`source_hash` are the recipient's / sender's `lxmf.delivery` DESTINATION hashes. For
 //! OPPORTUNISTIC delivery the leading `dest_hash` is stripped (the RNS packet header carries it) and
-//! everything after it is ECIES-encrypted to the recipient identity ([`rns_lite_core::crypto`]). The plaintext
-//! `packed` is deterministic given a fixed timestamp, so it is byte-exact provable vs Python LXMF.
+//! everything after it is ECIES-encrypted to the recipient identity ([`rns_lite_core::crypto`]).
+//! With fixed identities, timestamp and message data, the plaintext is deterministic.
 //!
 //! Text builders emit empty `fields`; audio Link/Resource builders emit native
 //! `FIELD_AUDIO`. Parsers tolerate non-empty fields and a trailing
-//! stamp element (stripped before hashing/verifying, matching `LXMessage.unpack_from_bytes`).
+//! stamp element outside the signed region. Parsers validate the first four elements;
+//! they do not validate or expose the stamp, later elements or trailing bytes.
 //!
 //! Notes / known limitations:
-//! - **Canonical msgpack assumption.** The 4-element payload used for the hash is the on-wire payload
-//!   with the array marker forced to `0x94` (and the stamp truncated). This is byte-identical to
-//!   Python's re-`packb` for any CONFORMANT sender (Python/Sideband/rsDeck all emit canonical
-//!   msgpack — fixarray, float64, minimal bin headers), so it produces the same hash for every
-//!   message Python accepts. A hypothetical non-canonical sender would be validated by lite (the
-//!   signature is genuinely over its bytes) but rejected by Python's canonical re-pack — a leniency
-//!   divergence, not a forgery risk. Full canonical re-encoding is deferred.
+//! - **MessagePack profile.** Parsing requires a fixarray with at least four elements
+//!   and a float64 timestamp. Title/content accept bin or str; interpreted field maps
+//!   have at most 64 unique integer keys. The hash retains the first four encoded
+//!   values and forces the array marker to `0x94`, without canonical re-encoding.
+//!   Python re-encodes these values when stripping a stamp, so a stamped message
+//!   using different integer/string encodings may produce a different message ID.
+//!   Do not assume every message accepted by another LXMF implementation is accepted here.
+//! - **Application policy.** A valid signature does not establish stamp cost, freshness,
+//!   replay protection or valid media content. The embedding runtime enforces those checks.
 //! - **Ratchets:** the `*_ratchet` variants decrypt via the retained ring
-//!   ([`rns_lite_core::ratchet`]) newest-first with base-key fallback, and encrypt to a peer's
-//!   remembered ratchet (upstream posture: always enable, never enforce). A caller that peeks to
+//!   ([`rns_lite_core::ratchet`]) in the supplied order with base-key fallback, and encrypt
+//!   to a supplied peer ratchet. Callers supply a bounded newest-first key slice and
+//!   keep it unchanged between peek and hinted parse. A caller that peeks to
 //!   recall the source identity should pass the returned key index to
 //!   [`parse_opportunistic_ratchet_hint`], avoiding a second full ring scan.
 
@@ -67,7 +71,7 @@ const PLAINTEXT_MAX: usize = crypto::MAX_ECIES_PLAINTEXT;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LxmfError {
-    /// title + content too large to fit a single-frame message.
+    /// Encoded size exceeds the selected path or caller capacity, or size arithmetic overflows.
     TooLong,
     /// Caller's output buffer is too small.
     OutputTooSmall,
@@ -423,7 +427,8 @@ impl Default for LxmfFieldScratch {
 }
 const _: () = assert!(core::mem::size_of::<LxmfFieldScratch>() == 1024);
 
-/// A validated, decoded inbound single-frame LXMF message.
+/// Borrowed message data returned by the opportunistic and Link/Resource parsers.
+/// Those parsers verify source binding and signature, but not stamp or application policy.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LxmfView<'a> {
     pub message_id: [u8; MESSAGE_ID_LENGTH],
@@ -498,7 +503,8 @@ fn build_plaintext(
 /// `source` (the local identity). Writes the ECIES-encrypted RNS packet payload into `out` and the
 /// recipient's `lxmf.delivery` destination hash (the RNS packet destination) into `out_dest_hash`;
 /// `*out_message_id` receives the 32-byte message id. `timestamp` is caller-supplied (no clock);
-/// `ephemeral_priv` + `iv` are caller entropy (fix them for deterministic vectors).
+/// `ephemeral_priv` + `iv` must be fresh cryptographic entropy for each message.
+/// Fixed values are for deterministic test vectors only.
 #[allow(clippy::too_many_arguments)]
 pub fn build_opportunistic(
     source: &LocalIdentity,
@@ -528,8 +534,8 @@ pub fn build_opportunistic(
 }
 
 /// Like [`build_opportunistic`] but ECIES-encrypting to the recipient's announced `ratchet`
-/// when one is known (upstream `Destination.encrypt` auto-prefers a remembered ratchet;
-/// `None` = base identity key). Plaintext, dest hash, and message id are identical either way —
+/// when supplied; `None` selects the base identity key. Plaintext, destination hash
+/// and message ID are identical either way —
 /// only the ECIES target key changes.
 #[allow(clippy::too_many_arguments)]
 pub fn build_opportunistic_ratchet(
@@ -604,6 +610,7 @@ pub fn build_plaintext_for_parity(
 /// `me` (the local identity), signed by the identity whose 64-byte public key is `source_public_key`
 /// (known from the source's announce). On success returns the decoded [`LxmfView`]. `scratch` holds
 /// the decrypted plaintext (use [`crypto::MAX_ECIES_PLAINTEXT`] bytes) and must outlive the view.
+/// MessagePack profile and stamp-validation limits are described in [`crate::lxmf`].
 pub fn parse_opportunistic<'a>(
     me: &LocalIdentity,
     packet_payload: &[u8],
@@ -619,9 +626,9 @@ pub fn parse_opportunistic<'a>(
     parse_decrypted(me, source_public_key, scratch, pt_len, field_scratch)
 }
 
-/// Like [`parse_opportunistic`] but trying `ratchet_privs` (our retained ring keys, newest first)
-/// before the base identity key (upstream `Identity.decrypt` with ratchets; the base-key fallback
-/// is never disabled). Also returns which ring index decrypted the payload (`None` = base key).
+/// Like [`parse_opportunistic`], trying `ratchet_privs` in supplied order before
+/// the base identity key. Supply a bounded newest-first slice; this function does
+/// not cap it. Returns the matching slice index (`None` = base key).
 pub fn parse_opportunistic_ratchet<'a>(
     me: &LocalIdentity,
     ratchet_privs: &[[u8; 32]],
@@ -652,9 +659,8 @@ pub fn parse_opportunistic_ratchet<'a>(
 ///
 /// `ratchet_index = Some(i)` tries only retained key `i`; `None` tries only the
 /// base identity key. An out-of-range or incorrect hint fails closed and never
-/// falls back to a ring scan. This keeps the normal source-recall pipeline to at
-/// most one 64-key scan while retaining the original scanning API for callers
-/// that do not peek first.
+/// falls back to a ring scan. Keep the key slice and packet unchanged after the
+/// peek. This avoids a second full scan; the caller bounds the initial key slice.
 pub fn parse_opportunistic_ratchet_hint<'a>(
     me: &LocalIdentity,
     ratchet_privs: &[[u8; 32]],
@@ -763,8 +769,9 @@ fn parse_decrypted<'a>(
 /// Decrypt-only PEEK of an inbound opportunistic payload's embedded `source_hash` (the first 16
 /// plaintext bytes), so the caller can recall the source public key BEFORE running the full
 /// validating [`parse_opportunistic`] (Python `Identity.recall` flow — the source is unknown at
-/// arrival). Fail-closed: reveals only the 16-byte hash; nothing is validated or stored here.
-/// `scratch` holds the decrypted plaintext ([`crypto::MAX_ECIES_PLAINTEXT`] bytes).
+/// arrival). The returned hash has not been bound to a sender signature; it is
+/// only a lookup hint. `scratch` contains the decrypted plaintext, which must not
+/// be published before full validation (use [`crypto::MAX_ECIES_PLAINTEXT`] bytes).
 pub fn peek_source_opportunistic(
     me: &LocalIdentity,
     packet_payload: &[u8],
@@ -773,9 +780,9 @@ pub fn peek_source_opportunistic(
     peek_source_opportunistic_ratchet(me, &[], packet_payload, scratch).map(|(hash, _)| hash)
 }
 
-/// Ratchet-aware [`peek_source_opportunistic`]: tries `ratchet_privs` newest-first before the
-/// base key, so ratcheted inbound can be peeked for source recall too. Returns the source hash
-/// and which ring index decrypted (`None` = base key).
+/// Ratchet-aware [`peek_source_opportunistic`]: tries the supplied keys in order,
+/// then the base key. The caller provides a bounded newest-first slice. Returns
+/// the unverified source hash and matching slice index (`None` = base key).
 pub fn peek_source_opportunistic_ratchet(
     me: &LocalIdentity,
     ratchet_privs: &[[u8; 32]],
@@ -804,7 +811,7 @@ pub fn peek_source_opportunistic_ratchet(
 /// Build the FULL packed LXMF message — `dest(16) || source(16) || signature(64) || msgpack
 /// payload` — for LINK/RESOURCE delivery (Python `DIRECT`: the sender transmits the full packed
 /// bytes in a single link packet or as a resource; no ECIES wrap, the link session crypto replaces
-/// it). Byte-identical to Python `LXMessage.pack()`. `scratch` is working memory for the
+/// it). Text messages contain empty fields and no stamp. `scratch` is working memory for the
 /// hashed/signed regions and must be at least `64 + payload` bytes (size it to `out.len()`);
 /// payload capacity is bounded by the smaller of `out.len() - 96` and `scratch.len() - 64`.
 #[allow(clippy::too_many_arguments)]
@@ -922,8 +929,8 @@ fn build_link_inner(
 /// source(16) || signature(64) || msgpack payload`. `me` must be the delivery destination
 /// (`DestinationMismatch` otherwise); `source_public_key` is recalled by the caller from
 /// `data[16..32]`. Same stamp-strip + signature semantics as [`parse_opportunistic`]
-/// (Python `LXMessage.unpack_from_bytes`). `scratch` is working memory for the hashed/signed
-/// region and must be at least `64 + payload` bytes (size it to `data.len()`).
+/// (including the limits in [`crate::lxmf`]). `scratch` is working memory for the
+/// hashed/signed region and must be at least `64 + payload` bytes (size it to `data.len()`).
 pub fn parse_link<'a>(
     me: &LocalIdentity,
     data: &'a [u8],
@@ -1017,7 +1024,10 @@ pub fn field_value_id(fields: &[u8], key: FieldId) -> Option<&[u8]> {
     }
     None
 }
-/// Validate the embedded outer-map profile before authentication/application publication.
+/// Check a recognized map for at most 64 unique integer keys and complete values.
+/// A non-map or unreadable map header returns `Ok(())`; this is not a general
+/// MessagePack validator. Message parsers validate the complete fields value first.
+/// Nested values are structurally traversed, not checked for duplicate nested keys.
 pub fn validate_fields(fields: &[u8], scratch: &mut LxmfFieldScratch) -> Result<(), LxmfError> {
     let Some((mut pos, count)) = read_map_header(fields) else {
         return Ok(());
@@ -1119,7 +1129,8 @@ fn read_audio_integer(value: &[u8]) -> Option<(u8, usize)> {
     Some((number[width - 1], width + 1))
 }
 
-/// The `bin`/`str` payload of a single msgpack value, if it is one.
+/// Return the first `bin`/`str` payload without checking UTF-8 or trailing bytes.
+/// Validate the complete encoded value separately when exact consumption matters.
 pub fn value_as_bytes(value: &[u8]) -> Option<&[u8]> {
     read_bin(value, 0).ok().map(|(b, _)| b)
 }

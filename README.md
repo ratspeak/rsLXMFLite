@@ -16,10 +16,14 @@ Reticulum cryptography and identity handling.
 The codec builds messages for single-packet (opportunistic) delivery or delivery
 over Links and Resources. It validates incoming messages against the sender's
 key and intended recipient, and supports current and retained destination ratchets.
-Client propagation codecs validate node announcements, append recipient stamps,
+Client propagation codecs parse authenticated node announcement data, append recipient stamps,
 encrypt and wrap relay uploads, and decrypt retrieved entries for the ordinary
 message validator. Relay selection and durable inbox acknowledgement remain
 the firmware's responsibility.
+
+Signature validation does not check recipient stamps, message age or replay
+policy. Message parsers ignore the appended stamp and trailing bytes; firmware
+must handle any required stamp and framing policy separately.
 
 Incoming message fields can be read without allocation. Full-width signed and
 unsigned integer IDs are preserved; duplicate outer IDs are rejected. Parsers
@@ -41,9 +45,10 @@ and does not support compression.
 ## Build and test
 
 Install Rust through `rustup`; the repository selects Rust 1.87 and the
-bare-metal check targets for production. Install current stable Rust (1.89 or
-newer) for host tests against the full Rust donor crates. The matrix explicitly
-separates these toolchains. These repositories must be siblings:
+bare-metal check targets for production. Install Rust 1.96.0 with Clippy and
+rustfmt for host tests against the full Rust donor crates; `scripts/test-matrix.sh` selects that exact version. The
+production library stays on 1.87.0. Start in a new working directory with these
+repositories as siblings:
 
 ```sh
 git clone https://github.com/ratspeak/rsLXMFLite.git
@@ -51,6 +56,7 @@ git clone https://github.com/ratspeak/rsReticulumLite.git
 git clone https://github.com/ratspeak/rsLXMF.git
 git clone https://github.com/ratspeak/rsReticulum.git
 cd rsLXMFLite
+rustup toolchain install 1.96.0 --component clippy --component rustfmt
 for refs in RNS_LITE_REF TRUSTED_REF; do
   while read -r repository revision; do
     git -C "../$repository" checkout --detach "$revision"
@@ -77,7 +83,9 @@ Keep both source revisions pinned in your build.
 The crates are distributed from source, not crates.io.
 
 See the [Link-message example](examples/link_message.rs).
-Build API documentation with `cargo doc --workspace --no-deps --open`.
+Run the host-only example with `cargo +1.96.0 run --example link_message --locked`;
+it constructs and validates a message locally and sends nothing.
+Build API documentation with `cargo +1.96.0 doc --workspace --no-deps --locked --open`.
 
 ## License
 
