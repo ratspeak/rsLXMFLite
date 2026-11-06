@@ -29,7 +29,11 @@ limit interpretation to 64 unique keys; malformed optional fields do not affect
 the preserved message bytes. Host profiles can be larger, so a valid host message
 is not automatically compatible with firmware. The Link/Resource audio
 builder writes standard LXMF `[mode, binary]` audio fields covered by the message
-signature; text and opportunistic builders retain empty fields. Audio framing is
+signature; the plain text builders write empty fields. The `*_with_fields`
+builders write caller-encoded fields (for example `FIELD_RESULTS`) for Link and
+opportunistic delivery, byte-identical to the full Rust codec. Recipient stamps
+come from a remembered `FIELD_TICKET` (`ticket_stamp`) or from proof of work;
+`seal_opportunistic` encrypts a stamped message into a single packet. Audio framing is
 separate from codec support, playback and application size/duration limits.
 Your firmware supplies identities, entropy, timestamps and buffers, and handles
 routing, Link sessions, Resource transfers, storage and retries. Resumable stamp

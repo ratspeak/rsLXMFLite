@@ -14,8 +14,9 @@
 //! `packed` is deterministic given a fixed timestamp, so it is byte-exact provable vs Python LXMF.
 //!
 //! Text builders emit empty `fields`; audio Link/Resource builders emit native
-//! `FIELD_AUDIO`. Parsers tolerate non-empty fields and a trailing
-//! stamp element (stripped before hashing/verifying, matching `LXMessage.unpack_from_bytes`).
+//! `FIELD_AUDIO`; `*_with_fields` builders emit caller-encoded entries. Parsers
+//! tolerate non-empty fields and a trailing stamp element (stripped before
+//! hashing/verifying, matching `LXMessage.unpack_from_bytes`).
 //!
 //! Notes / known limitations:
 //! - **Canonical msgpack assumption.** The 4-element payload used for the hash is the on-wire payload
@@ -47,6 +48,18 @@ pub const MESSAGE_ID_LENGTH: usize = 32;
 pub const FIELD_AUDIO: u8 = 0x07;
 /// Standard LXMF native Codec2 700C audio mode.
 pub const AM_CODEC2_700C: u8 = 0x03;
+/// Standard LXMF results field: an application-defined MessagePack value.
+pub const FIELD_RESULTS: u8 = 0x0A;
+/// Standard LXMF ticket field: `[expires, ticket(16)]`.
+pub const FIELD_TICKET: u8 = 0x0C;
+/// Outer-field limit of this crate's embedded profile (builders and parsers).
+pub const MAX_FIELDS: usize = 64;
+
+/// One caller-encoded outer field: `(id, exactly one complete MessagePack value)`.
+///
+/// The value bytes are written verbatim, as `lxmf_core` `set_msgpack_field`
+/// does. Encode a raw byte string as MessagePack bin to match `set_field`.
+pub type EncodedField<'a> = (u8, &'a [u8]);
 
 /// Standard `[mode, binary]` audio, borrowed without decoding or allocation.
 ///
@@ -168,7 +181,7 @@ fn write_bin<W: PayloadWriter>(writer: &mut W, field: W::Field) -> Result<(), Lx
 }
 
 fn write_fields_header<W: PayloadWriter>(writer: &mut W, count: usize) -> Result<(), LxmfError> {
-    if count > 64 {
+    if count > MAX_FIELDS {
         return Err(LxmfError::TooManyFields);
     }
     if count < 16 {
@@ -178,31 +191,86 @@ fn write_fields_header<W: PayloadWriter>(writer: &mut W, count: usize) -> Result
     }
 }
 
+/// Outer `fields` element of a payload being written.
+enum PayloadFields<'f, F> {
+    Empty,
+    Audio(u8, F),
+    /// Caller-encoded entries, already validated by [`encoded_field_set`].
+    Encoded(&'f [EncodedField<'f>], [u8; 32]),
+}
+
 fn write_payload<W: PayloadWriter>(
     writer: &mut W,
     timestamp: f64,
     title: W::Field,
     content: W::Field,
-    audio: Option<(u8, W::Field)>,
+    fields: PayloadFields<'_, W::Field>,
 ) -> Result<(), LxmfError> {
     writer.write(&[0x94, 0xcb])?; // [timestamp, title, content, fields]
     writer.write(&timestamp.to_be_bytes())?;
     write_bin(writer, title)?;
     write_bin(writer, content)?;
-    write_fields_header(writer, usize::from(audio.is_some()))?;
-    if let Some((mode, bytes)) = audio {
-        // Donor: lxmf-core AudioFieldRef + native fields-map writer. The value
-        // is an array containing an integer and bin, never a bin-wrapped array.
-        writer.write(&[FIELD_AUDIO, 0x92])?;
-        if mode <= 0x7f {
-            writer.write(&[mode])?;
-        } else {
-            writer.write(&[0xcc, mode])?;
+    match fields {
+        PayloadFields::Empty => write_fields_header(writer, 0),
+        PayloadFields::Audio(mode, bytes) => {
+            // Donor: lxmf-core AudioFieldRef + native fields-map writer. The value
+            // is an array containing an integer and bin, never a bin-wrapped array.
+            write_fields_header(writer, 1)?;
+            writer.write(&[FIELD_AUDIO, 0x92])?;
+            if mode <= 0x7f {
+                writer.write(&[mode])?;
+            } else {
+                writer.write(&[0xcc, mode])?;
+            }
+            write_bin(writer, bytes)
         }
-        write_bin(writer, bytes)
-    } else {
-        Ok(())
+        PayloadFields::Encoded(entries, present) => {
+            // Donor: lxmf-core LxMessageDraft::write_payload. Its BTreeMap emits
+            // ascending ids as minimal uints followed by the verbatim value bytes.
+            write_fields_header(writer, entries.len())?;
+            for id in 0..=u8::MAX {
+                if present[usize::from(id / 8)] & (1 << (id % 8)) == 0 {
+                    continue;
+                }
+                if id <= 0x7f {
+                    writer.write(&[id])?;
+                } else {
+                    writer.write(&[0xcc, id])?;
+                }
+                for &(entry_id, value) in entries {
+                    if entry_id == id {
+                        writer.write(value)?;
+                    }
+                }
+            }
+            Ok(())
+        }
     }
+}
+
+/// Check caller-encoded entries; returns the bitset of present ids.
+///
+/// Mirrors `lxmf_core::message::EncodedFieldValue::new` (one complete value,
+/// no trailing bytes) within this crate's parser profile: at most 64 entries,
+/// nesting accepted by the inbound validator, no extension types. Ids must be
+/// unique; the trusted draft's replace-on-set has no slice equivalent.
+fn encoded_field_set(fields: &[EncodedField<'_>]) -> Result<[u8; 32], LxmfError> {
+    if fields.len() > MAX_FIELDS {
+        return Err(LxmfError::TooManyFields);
+    }
+    let mut present = [0u8; 32];
+    for &(id, value) in fields {
+        let (byte, bit) = (usize::from(id / 8), 1 << (id % 8));
+        if present[byte] & bit != 0 {
+            return Err(LxmfError::DuplicateField);
+        }
+        present[byte] |= bit;
+        // Depth 1: the inbound parser walks values one level below the fields map.
+        if skip_value(value, 0, 1)? != value.len() {
+            return Err(LxmfError::MalformedPayload);
+        }
+    }
+    Ok(present)
 }
 
 /// Exact full packed LXMF length, without allocating, reading message bodies,
@@ -210,7 +278,13 @@ fn write_payload<W: PayloadWriter>(
 /// the same payload encoder chooses bin8/bin16/bin32 in construction and counting.
 pub fn packed_len(title_len: usize, content_len: usize) -> Result<usize, LxmfError> {
     let mut writer = SizeWriter(LXMF_PACKED_PREFIX);
-    write_payload(&mut writer, 0.0, title_len, content_len, None)?;
+    write_payload(
+        &mut writer,
+        0.0,
+        title_len,
+        content_len,
+        PayloadFields::Empty,
+    )?;
     Ok(writer.0)
 }
 
@@ -231,39 +305,45 @@ pub fn packed_len_with_audio(
         0.0,
         title_len,
         content_len,
-        Some((mode, audio_len)),
+        PayloadFields::Audio(mode, audio_len),
     )?;
     Ok(writer.0)
 }
 
-/// Pack `[timestamp, title, content, {}]` into `out`.
+/// Exact signed message size with caller-encoded fields (no stamp).
+///
+/// Validates `fields` exactly as the `*_with_fields` builders do. Add 18 bytes
+/// for a ticket stamp or 34 for a proof-of-work stamp.
+pub fn packed_len_with_fields(
+    title_len: usize,
+    content_len: usize,
+    fields: &[EncodedField<'_>],
+) -> Result<usize, LxmfError> {
+    let present = encoded_field_set(fields)?;
+    let mut writer = SizeWriter(LXMF_PACKED_PREFIX);
+    write_payload(
+        &mut writer,
+        0.0,
+        title_len,
+        content_len,
+        PayloadFields::Encoded(fields, present),
+    )?;
+    Ok(writer.0)
+}
+
+/// Pack `[timestamp, title, content, fields]` into `out`.
 fn pack_payload(
     timestamp: f64,
     title: &[u8],
     content: &[u8],
-    out: &mut [u8],
-) -> Result<usize, LxmfError> {
-    pack_payload_with_audio(timestamp, title, content, None, out)
-}
-
-fn pack_payload_with_audio(
-    timestamp: f64,
-    title: &[u8],
-    content: &[u8],
-    audio: Option<AudioField<'_>>,
+    fields: PayloadFields<'_, &[u8]>,
     out: &mut [u8],
 ) -> Result<usize, LxmfError> {
     let mut writer = SliceWriter {
         output: out,
         position: 0,
     };
-    write_payload(
-        &mut writer,
-        timestamp,
-        title,
-        content,
-        audio.map(|a| (a.mode, a.bytes)),
-    )?;
+    write_payload(&mut writer, timestamp, title, content, fields)?;
     Ok(writer.position)
 }
 
@@ -453,6 +533,7 @@ fn build_plaintext(
     timestamp: f64,
     title: &[u8],
     content: &[u8],
+    fields: PayloadFields<'_, &[u8]>,
     out_plaintext: &mut [u8],
     out_dest_hash: &mut [u8; LXMF_DEST_LENGTH],
     out_message_id: &mut [u8; MESSAGE_ID_LENGTH],
@@ -465,10 +546,12 @@ fn build_plaintext(
     // payload = msgpack([timestamp, title, content, {}]); its buffer is the single-frame bound.
     let mut payload = [0u8; MAX_LXMF_PAYLOAD];
     let plen =
-        pack_payload(timestamp, title, content, &mut payload).map_err(|error| match error {
-            LxmfError::OutputTooSmall => LxmfError::TooLong,
-            other => other,
-        })?;
+        pack_payload(timestamp, title, content, fields, &mut payload).map_err(
+            |error| match error {
+                LxmfError::OutputTooSmall => LxmfError::TooLong,
+                other => other,
+            },
+        )?;
 
     // hashed_part = dest || source || payload -> hash (= message_id); signed_part = hashed_part || hash
     let mut signed = [0u8; LXMF_DEST_LENGTH * 2 + MAX_LXMF_PAYLOAD + MESSAGE_ID_LENGTH];
@@ -545,6 +628,116 @@ pub fn build_opportunistic_ratchet(
     out_dest_hash: &mut [u8; LXMF_DEST_LENGTH],
     out_message_id: &mut [u8; MESSAGE_ID_LENGTH],
 ) -> Result<usize, LxmfError> {
+    build_opportunistic_inner(
+        source,
+        recipient_public_key,
+        ratchet,
+        timestamp,
+        title,
+        content,
+        PayloadFields::Empty,
+        ephemeral_priv,
+        iv,
+        out,
+        out_dest_hash,
+        out_message_id,
+    )
+}
+
+/// [`build_opportunistic`] with caller-encoded outer `fields` (for example
+/// [`FIELD_RESULTS`]), encrypted to the recipient's base identity key.
+///
+/// Entries may be given in any order; they are written in ascending id order,
+/// byte-identical to `lxmf_core` `LxMessageDraft::set_msgpack_field` for the
+/// same ids and values. Rejected: more than [`MAX_FIELDS`] entries
+/// (`TooManyFields`), a repeated id (`DuplicateField`), or a value that is not
+/// exactly one complete MessagePack object within the parser's nesting limit
+/// (`MalformedPayload`). A message larger than one packet is `TooLong`; send it
+/// over a Link with [`build_link_with_fields`] instead.
+///
+/// No stamp is attached. For a recipient stamp, use [`build_link_with_fields`],
+/// [`crate::propagation::append_recipient_stamp`] and [`seal_opportunistic`].
+/// Stack: about 1.1 KiB of fixed working arrays; no heap.
+#[allow(clippy::too_many_arguments)]
+pub fn build_opportunistic_with_fields(
+    source: &LocalIdentity,
+    recipient_public_key: &[u8; 64],
+    timestamp: f64,
+    title: &[u8],
+    content: &[u8],
+    fields: &[EncodedField<'_>],
+    ephemeral_priv: &[u8; 32],
+    iv: &[u8; 16],
+    out: &mut [u8],
+    out_dest_hash: &mut [u8; LXMF_DEST_LENGTH],
+    out_message_id: &mut [u8; MESSAGE_ID_LENGTH],
+) -> Result<usize, LxmfError> {
+    build_opportunistic_ratchet_with_fields(
+        source,
+        recipient_public_key,
+        None,
+        timestamp,
+        title,
+        content,
+        fields,
+        ephemeral_priv,
+        iv,
+        out,
+        out_dest_hash,
+        out_message_id,
+    )
+}
+
+/// [`build_opportunistic_with_fields`], encrypted to the recipient's announced
+/// `ratchet` when one is known (`None` = base identity key), as
+/// [`build_opportunistic_ratchet`] does.
+#[allow(clippy::too_many_arguments)]
+pub fn build_opportunistic_ratchet_with_fields(
+    source: &LocalIdentity,
+    recipient_public_key: &[u8; 64],
+    ratchet: Option<&[u8; 32]>,
+    timestamp: f64,
+    title: &[u8],
+    content: &[u8],
+    fields: &[EncodedField<'_>],
+    ephemeral_priv: &[u8; 32],
+    iv: &[u8; 16],
+    out: &mut [u8],
+    out_dest_hash: &mut [u8; LXMF_DEST_LENGTH],
+    out_message_id: &mut [u8; MESSAGE_ID_LENGTH],
+) -> Result<usize, LxmfError> {
+    let present = encoded_field_set(fields)?;
+    build_opportunistic_inner(
+        source,
+        recipient_public_key,
+        ratchet,
+        timestamp,
+        title,
+        content,
+        PayloadFields::Encoded(fields, present),
+        ephemeral_priv,
+        iv,
+        out,
+        out_dest_hash,
+        out_message_id,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_opportunistic_inner(
+    source: &LocalIdentity,
+    recipient_public_key: &[u8; 64],
+    ratchet: Option<&[u8; 32]>,
+    timestamp: f64,
+    title: &[u8],
+    content: &[u8],
+    fields: PayloadFields<'_, &[u8]>,
+    ephemeral_priv: &[u8; 32],
+    iv: &[u8; 16],
+    out: &mut [u8],
+    out_dest_hash: &mut [u8; LXMF_DEST_LENGTH],
+    out_message_id: &mut [u8; MESSAGE_ID_LENGTH],
+) -> Result<usize, LxmfError> {
     let mut plaintext = [0u8; PLAINTEXT_MAX];
     let pt_len = build_plaintext(
         source,
@@ -552,6 +745,7 @@ pub fn build_opportunistic_ratchet(
         timestamp,
         title,
         content,
+        fields,
         &mut plaintext,
         out_dest_hash,
         out_message_id,
@@ -570,6 +764,86 @@ pub fn build_opportunistic_ratchet(
         out,
     )?;
     Ok(n)
+}
+
+/// Encrypt a full packed message, optionally carrying a recipient stamp, into
+/// the payload of one opportunistic packet, in place.
+///
+/// `buffer[..packed_len]` holds `dest || source || signature || payload`, as
+/// from [`build_link_with_fields`] and then
+/// [`crate::propagation::append_recipient_stamp`]. On success `buffer[..n]` is
+/// the RNS packet data for the recipient's `lxmf.delivery` destination; the
+/// plaintext is identical to what the opportunistic builders encrypt. `buffer`
+/// must hold the ciphertext: `packed_len + 65..=packed_len + 80` bytes, at most
+/// the packet MDU. A message larger than one packet is `TooLong` and is left
+/// intact for Link delivery. `ratchet`, `ephemeral_priv` and `iv` are as for
+/// [`build_opportunistic_ratchet`]. No stack arrays; no heap.
+///
+/// ```
+/// use lxmf_lite_core::{build_link_with_fields, seal_opportunistic, FIELD_RESULTS};
+/// use lxmf_lite_core::propagation::append_recipient_stamp;
+/// use lxmf_lite_core::stamp::ticket_stamp;
+/// use rns_lite_core::LocalIdentity;
+///
+/// let node = LocalIdentity::from_private_key(&[0x51; 64]);
+/// let manager = LocalIdentity::from_private_key(&[0x52; 64]);
+/// let ticket = [0x5a; 16]; // remembered from the manager's FIELD_TICKET
+/// let results = [0x81, 0x00, 0x01]; // {0: 1}, encoded by the caller
+/// let (mut buffer, mut scratch) = ([0u8; 500], [0u8; 500]);
+/// let mut message_id = [0u8; 32];
+/// let n = build_link_with_fields(
+///     &node, manager.public_key(), 1_750_000_000.0, b"", b"ok",
+///     &[(FIELD_RESULTS, &results)],
+///     &mut buffer, &mut scratch, &mut [0; 16], &mut message_id,
+/// )?;
+/// // A proof-of-work stamp from `stamp::StampSearch` over `message_id` works the same way.
+/// let n = append_recipient_stamp(&mut buffer, n, &ticket_stamp(&ticket, &message_id))?;
+/// let n = seal_opportunistic(&mut buffer, n, manager.public_key(), None, &[1; 32], &[2; 16])?;
+/// assert!(n <= rns_lite_core::constants::MDU);
+/// # Ok::<(), lxmf_lite_core::LxmfError>(())
+/// ```
+pub fn seal_opportunistic(
+    buffer: &mut [u8],
+    packed_len: usize,
+    recipient_public_key: &[u8; 64],
+    ratchet: Option<&[u8; 32]>,
+    ephemeral_priv: &[u8; 32],
+    iv: &[u8; 16],
+) -> Result<usize, LxmfError> {
+    if packed_len <= LXMF_PACKED_PREFIX
+        || packed_len > buffer.len()
+        || !matches!(buffer[LXMF_PACKED_PREFIX], 0x94 | 0x95)
+        || skip_value(&buffer[..packed_len], LXMF_PACKED_PREFIX, 0)? != packed_len
+    {
+        return Err(LxmfError::MalformedPayload);
+    }
+    let recipient_id_hash = identity_hash(recipient_public_key);
+    let dest_hash =
+        destination_hash_from_parts(&name_hash(LXMF_DELIVERY_NAME), Some(&recipient_id_hash));
+    if buffer[..LXMF_DEST_LENGTH] != dest_hash {
+        return Err(LxmfError::DestinationMismatch);
+    }
+    let plaintext_len = packed_len - LXMF_DEST_LENGTH;
+    if plaintext_len > PLAINTEXT_MAX {
+        return Err(LxmfError::TooLong);
+    }
+    let total = crypto::ecies_ciphertext_len(plaintext_len)?;
+    if total > buffer.len() {
+        return Err(LxmfError::OutputTooSmall);
+    }
+    buffer.copy_within(LXMF_DEST_LENGTH..packed_len, crypto::ECIES_PLAINTEXT_OFFSET);
+    let target: [u8; 32] = ratchet
+        .copied()
+        .unwrap_or_else(|| recipient_public_key[..32].try_into().unwrap());
+    crypto::ecies_encrypt_in_place(
+        &target,
+        &recipient_id_hash,
+        ephemeral_priv,
+        iv,
+        &mut buffer[..total],
+        plaintext_len,
+    )?;
+    Ok(total)
 }
 
 /// Build the deterministic LXMF plaintext (`packed[16..]`) only — for byte-exact parity vectors.
@@ -592,6 +866,7 @@ pub fn build_plaintext_for_parity(
         timestamp,
         title,
         content,
+        PayloadFields::Empty,
         out_plaintext,
         out_dest_hash,
         out_message_id,
@@ -825,7 +1100,7 @@ pub fn build_link(
         timestamp,
         title,
         content,
-        None,
+        PayloadFields::Empty,
         out,
         scratch,
         out_dest_hash,
@@ -859,7 +1134,44 @@ pub fn build_link_with_audio(
         timestamp,
         title,
         content,
-        Some(audio),
+        PayloadFields::Audio(audio.mode, audio.bytes),
+        out,
+        scratch,
+        out_dest_hash,
+        out_message_id,
+    )
+}
+
+/// Build a signed Link/Resource message with caller-encoded outer `fields`.
+///
+/// Field rules and ordering are as for [`build_opportunistic_with_fields`];
+/// the output is byte-identical to `lxmf_core` `LxMessageDraft::pack` with the
+/// same `set_msgpack_field` calls. Scratch/capacity requirements match
+/// [`build_link`]; size buffers with [`packed_len_with_fields`]. The result
+/// accepts [`crate::propagation::append_recipient_stamp`], and
+/// [`seal_opportunistic`] turns it into a single opportunistic packet.
+/// Stack: a 32-byte id set; no heap.
+#[allow(clippy::too_many_arguments)]
+pub fn build_link_with_fields(
+    source: &LocalIdentity,
+    recipient_public_key: &[u8; 64],
+    timestamp: f64,
+    title: &[u8],
+    content: &[u8],
+    fields: &[EncodedField<'_>],
+    out: &mut [u8],
+    scratch: &mut [u8],
+    out_dest_hash: &mut [u8; LXMF_DEST_LENGTH],
+    out_message_id: &mut [u8; MESSAGE_ID_LENGTH],
+) -> Result<usize, LxmfError> {
+    let present = encoded_field_set(fields)?;
+    build_link_inner(
+        source,
+        recipient_public_key,
+        timestamp,
+        title,
+        content,
+        PayloadFields::Encoded(fields, present),
         out,
         scratch,
         out_dest_hash,
@@ -874,7 +1186,7 @@ fn build_link_inner(
     timestamp: f64,
     title: &[u8],
     content: &[u8],
-    audio: Option<AudioField<'_>>,
+    fields: PayloadFields<'_, &[u8]>,
     out: &mut [u8],
     scratch: &mut [u8],
     out_dest_hash: &mut [u8; LXMF_DEST_LENGTH],
@@ -890,11 +1202,11 @@ fn build_link_inner(
 
     // scratch = dest(16) || source(16) || payload(plen) || hash(32); payload packed in place.
     let scratch_len = scratch.len();
-    let plen = pack_payload_with_audio(
+    let plen = pack_payload(
         timestamp,
         title,
         content,
-        audio,
+        fields,
         &mut scratch[32..scratch_len - 32],
     )
     .map_err(|_| LxmfError::TooLong)?;
@@ -1098,6 +1410,66 @@ pub fn audio_field(fields: &[u8]) -> Result<Option<AudioField<'_>>, LxmfError> {
         return Err(LxmfError::MalformedPayload);
     }
     Ok(Some(AudioField { mode, bytes }))
+}
+
+/// A ticket offered by the sender in [`FIELD_TICKET`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TicketField {
+    /// Expiry, Unix epoch seconds.
+    pub expires: f64,
+    pub ticket: [u8; crate::stamp::TICKET_LENGTH],
+}
+
+/// Read an unexpired `[expires, ticket(16)]` from an authenticated message's fields.
+///
+/// Adapted from `lxmf_core::ticket::Ticket::decode_field`: exactly two
+/// elements, any MessagePack number as a finite expiry later than `now`, and a
+/// 16-byte bin or str ticket; anything else is `None`. Only read fields of a
+/// validated [`LxmfView`], and bind the ticket to its `source_hash`. Stamp
+/// replies to that sender with [`crate::stamp::ticket_stamp`] until expiry.
+pub fn ticket_field(fields: &[u8], now: f64) -> Option<TicketField> {
+    let value = field_value(fields, FIELD_TICKET)?;
+    let first = match value {
+        [0x92, ..] => 1,
+        [0xdc, 0, 2, ..] => 3,
+        [0xdd, 0, 0, 0, 2, ..] => 5,
+        _ => return None,
+    };
+    let (expires, after) = read_number(value, first)?;
+    let (ticket, end) = read_bin(value, after).ok()?;
+    if end != value.len() || !expires.is_finite() || expires <= now {
+        return None;
+    }
+    Some(TicketField {
+        expires,
+        ticket: ticket.try_into().ok()?,
+    })
+}
+
+// rmpv `Value::as_f64`: every integer and float encoding, widened to f64.
+fn read_number(data: &[u8], pos: usize) -> Option<(f64, usize)> {
+    let marker = *data.get(pos)?;
+    let width = match marker {
+        0x00..=0x7f => return Some((f64::from(marker), pos + 1)),
+        0xe0..=0xff => return Some((f64::from(marker as i8), pos + 1)),
+        0xcc | 0xd0 => 1,
+        0xcd | 0xd1 => 2,
+        0xca | 0xce | 0xd2 => 4,
+        0xcb | 0xcf | 0xd3 => 8,
+        _ => return None,
+    };
+    let bytes = data.get(pos + 1..pos + 1 + width)?;
+    let mut raw = [0u8; 8];
+    raw[8 - width..].copy_from_slice(bytes);
+    let unsigned = u64::from_be_bytes(raw);
+    let value = match marker {
+        0xca => f64::from(f32::from_bits(unsigned as u32)),
+        0xcb => f64::from_bits(unsigned),
+        0xcc..=0xcf => unsigned as f64,
+        // Sign-extend the big-endian two's-complement value.
+        _ => ((unsigned << (64 - 8 * width)) as i64 >> (64 - 8 * width)) as f64,
+    };
+    Some((value, pos + 1 + width))
 }
 
 // All signed/unsigned MessagePack integer encodings are accepted only when the
@@ -1516,7 +1888,7 @@ mod tests {
             let size = packed_len(title_len, content_len).unwrap();
             let mut payload = std::vec![0; size - LXMF_PACKED_PREFIX];
             assert_eq!(
-                pack_payload(1.0, &title, &content, &mut payload).unwrap(),
+                pack_payload(1.0, &title, &content, PayloadFields::Empty, &mut payload).unwrap(),
                 payload.len()
             );
             assert_eq!(
@@ -1524,6 +1896,7 @@ mod tests {
                     1.0,
                     &title,
                     &content,
+                    PayloadFields::Empty,
                     &mut payload[..size - LXMF_PACKED_PREFIX - 1]
                 ),
                 Err(LxmfError::OutputTooSmall)

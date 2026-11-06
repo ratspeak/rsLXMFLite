@@ -73,3 +73,39 @@ pub fn build_audio<'a>(
     )?;
     Ok(&out[..n])
 }
+
+/// A node reply: caller-encoded results, a ticket stamp, one opportunistic packet.
+pub fn build_stamped_reply<'a>(
+    node: &LocalIdentity,
+    manager: &LocalIdentity,
+    results: &[u8],
+    ticket: &[u8; 16],
+    out: &'a mut [u8; 464],
+    scratch: &mut [u8; 464],
+) -> Result<&'a [u8], LxmfError> {
+    use lxmf_lite_core::{
+        FIELD_RESULTS, build_link_with_fields, propagation::append_recipient_stamp,
+        seal_opportunistic, stamp::ticket_stamp,
+    };
+    let mut message_id = [0u8; 32];
+    let n = build_link_with_fields(
+        node,
+        manager.public_key(),
+        1_750_000_000.0,
+        b"",
+        b"Status: ok",
+        &[(FIELD_RESULTS, results)],
+        out,
+        scratch,
+        &mut [0; 16],
+        &mut message_id,
+    )?;
+    let n = append_recipient_stamp(out, n, &ticket_stamp(ticket, &message_id))?;
+    let n = seal_opportunistic(out, n, manager.public_key(), None, &[1; 32], &[2; 16])?;
+    Ok(&out[..n])
+}
+
+/// The ticket a manager offered in an authenticated command, if still valid.
+pub fn learned_ticket(view: &LxmfView<'_>, now: f64) -> Option<[u8; 16]> {
+    lxmf_lite_core::ticket_field(view.fields, now).map(|field| field.ticket)
+}

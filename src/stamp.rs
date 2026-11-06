@@ -9,6 +9,23 @@
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 
+/// Ticket length in bytes; also the length of a ticket stamp.
+pub const TICKET_LENGTH: usize = 16;
+
+/// Recipient stamp from a ticket the recipient issued: `truncated_hash(ticket || message_id)`.
+///
+/// Adapted from `lxmf_core` `SignedLxMessage::generate_recipient_stamp`. Append it with
+/// [`crate::propagation::append_recipient_stamp`]; it replaces proof of work entirely.
+pub fn ticket_stamp(ticket: &[u8; TICKET_LENGTH], message_id: &[u8; 32]) -> [u8; TICKET_LENGTH] {
+    let digest = Sha256::new()
+        .chain_update(ticket)
+        .chain_update(message_id)
+        .finalize();
+    let mut stamp = [0; TICKET_LENGTH];
+    stamp.copy_from_slice(&digest[..TICKET_LENGTH]);
+    stamp
+}
+
 /// Protocol-defined workblock sizes, including peering for parity validation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StampKind {

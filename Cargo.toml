@@ -36,3 +36,5 @@ rns-identity = { path = "../rsReticulum/crates/rns-identity", version = "~1.4.0"
 rns-crypto = { path = "../rsReticulum/crates/rns-crypto", version = "~1.4.0" }
 rns-link = { path = "../rsReticulum/crates/rns-link", version = "~1.4.0" }
 rmpv = "1"
+# Reads the upstream-generated JSON fixtures.
+serde_json = "1"
