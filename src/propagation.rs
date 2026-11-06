@@ -23,7 +23,8 @@ pub enum GetRequest<'a> {
 /// Pack the Link REQUEST plaintext `[timestamp, hash("/get"), data]`.
 /// Adapted from `rns-link::Link::prepare_request` and the LXMF propagation client.
 /// Always fits a Link packet. The request ID is the TRANSMITTED packet hash's
-/// first 16 bytes, not the hash of these plaintext bytes. The host must install
+/// first 16 bytes for packet delivery, not the hash of these plaintext bytes.
+/// This helper neither sends nor tracks the request. The host must install
 /// that ID, Link incarnation and deadline before driver admission/callbacks.
 pub fn build_get_request(
     timestamp: f64,
@@ -72,9 +73,10 @@ pub fn build_get_request(
     Ok(total)
 }
 
-/// Validate a decrypted packet/Resource RESPONSE envelope against its one live
-/// request. Returns the borrowed, still-encoded response value. Unlike the full
-/// parser this rejects extra envelope elements and trailing data.
+/// Match a decrypted packet/Resource RESPONSE envelope to `expected_id` and
+/// return its borrowed, still-encoded response value. Extra envelope elements
+/// and trailing data are rejected. The caller checks authenticated Link ownership,
+/// the request's live state and deadline; this helper has no request registry.
 pub fn response_data<'a>(data: &'a [u8], expected_id: &[u8; 16]) -> Result<&'a [u8], LxmfError> {
     let mut items = array_items(data)?;
     if items.len() != 2 {
@@ -87,8 +89,8 @@ pub fn response_data<'a>(data: &'a [u8], expected_id: &[u8; 16]) -> Result<&'a [
     items.next().ok_or(LxmfError::MalformedPayload)
 }
 
-/// Validate the entire node list but retain only the first ID (smallest message
-/// first on a conforming node). Re-list after a bounded fetch/purge cycle.
+/// Validate the entire node list but retain only its first advertised ID.
+/// The server determines ordering. Re-list after a bounded fetch/purge cycle.
 pub fn first_available(data: &[u8]) -> Result<(Option<[u8; 32]>, usize), LxmfError> {
     available_at(data, 0)
 }
@@ -129,7 +131,8 @@ pub fn fetched_message(data: &[u8]) -> Result<Option<&[u8]>, LxmfError> {
 pub struct NodeAnnounce<'a> {
     pub timebase: u64,
     pub enabled: bool,
-    /// Decimal kilobytes, as in the trusted LXMF announce codec.
+    /// Decimal kilobytes. The caller must check conversion to its local byte
+    /// and buffer limits; a valid `u64` value need not fit a 32-bit device.
     pub transfer_limit_kb: u64,
     pub sync_limit_kb: u64,
     pub stamp_cost: u8,
@@ -139,8 +142,9 @@ pub struct NodeAnnounce<'a> {
     pub name: Option<&'a [u8]>,
 }
 
-/// Fully validate one bounded MessagePack array, including unknown extensions.
-/// Reject trailing bytes, excessive nesting and impossible length prefixes.
+/// Validate one complete array using the supported MessagePack value types.
+/// Reject trailing bytes, excessive nesting, truncated values and MessagePack
+/// extension types. Work is bounded by the input slice, whose size the caller limits.
 pub fn array_items(data: &[u8]) -> Result<ArrayItems<'_>, LxmfError> {
     if skip_value(data, 0, 0)? != data.len() {
         return Err(LxmfError::MalformedPayload);
@@ -221,9 +225,10 @@ fn unsigned(data: &[u8]) -> Option<u64> {
     }
 }
 
-/// Parse signed-announce app data only after Reticulum authentication/binding.
-/// Numeric fields follow trusted integer/float truncation. Unlike the desktop
-/// parser, negative/overflowed timebases fail closed instead of wrapping.
+/// Parse node app data after the caller authenticates and binds the announce.
+/// Finite nonnegative numeric fields are truncated toward zero; timebases above
+/// `i64::MAX` and byte-limit arithmetic overflow are rejected. Optional name
+/// metadata can be ignored when its field-map profile is unsupported.
 pub fn parse_node_announce(data: &[u8]) -> Option<NodeAnnounce<'_>> {
     let mut items = array_items(data).ok()?;
     if items.len() < 7 {
@@ -287,6 +292,7 @@ pub fn delivery_stamp_cost(data: &[u8]) -> Option<Option<u8>> {
 
 /// Append a recipient PoW (32 bytes) or ticket (16 bytes) to a freshly packed
 /// four-element message. Its signed region and message ID stay unchanged.
+/// This checks framing and stamp length, not the signature or proof of work.
 pub fn append_recipient_stamp(
     packed: &mut [u8],
     packed_len: usize,
@@ -314,7 +320,9 @@ pub fn append_recipient_stamp(
 }
 
 /// Encrypt a full signed packed message in place, retaining the destination
-/// prefix. Returns the entry length BEFORE the PN stamp and its transient ID.
+/// prefix. The caller must supply a correctly signed message and fresh
+/// cryptographic `ephemeral_priv`/`iv`; this function does not validate its signature.
+/// Returns the entry length BEFORE the PN stamp and its transient ID.
 /// Persist/reuse these exact encrypted bytes for retries and resumable PoW.
 pub fn encrypt_message(
     buffer: &mut [u8],
@@ -357,7 +365,9 @@ pub fn encrypt_message(
 }
 
 /// Decrypt one `/get` entry (the node has already stripped its PN stamp),
-/// trying retained recipient keys newest-first and then the base key. Restores
+/// trying retained recipient keys in caller-supplied order, then the base key.
+/// Supply newest-first keys and bound the slice length; there is no built-in cap.
+/// Pass exactly the encrypted entry, without unused buffer capacity. Restores
 /// the full packed message for ordinary LXMF signature validation. Authentication
 /// is not sender validation: callers must still use `parse_link` before storing.
 /// The returned transient ID refers to the original encrypted entry, for purge
@@ -395,7 +405,9 @@ pub fn decrypt_message(
 
 /// Wrap one retained encrypted entry plus its PN stamp for upload. Cost zero
 /// still requires the 32-byte PN stamp. `timestamp` is the upload timestamp,
-/// independent of the original signed message timestamp.
+/// independent of the original signed message timestamp. The encrypted entry
+/// plus stamp must fit a MessagePack bin16 value and the supplied buffer.
+/// This helper does not validate the encrypted entry or stamp's proof of work.
 pub fn wrap_upload(
     buffer: &mut [u8],
     encrypted_len: usize,
