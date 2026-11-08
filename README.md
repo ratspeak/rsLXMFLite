@@ -2,13 +2,14 @@
 
 [![CI](https://github.com/ratspeak/rsLXMFLite/actions/workflows/ci.yml/badge.svg)](https://github.com/ratspeak/rsLXMFLite/actions/workflows/ci.yml)
 [![Rust 1.87+](https://img.shields.io/badge/rust-1.87%2B-orange.svg)](https://www.rust-lang.org)
-[![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
+[![License: Reticulum License](https://img.shields.io/badge/license-Reticulum%20License-blue.svg)](LICENSE)
 
 **LXMF in Rust for microcontrollers.**
 
 `lxmf-lite-core` constructs and validates LXMF messages without allocation or
-`std`. It adapts the codec from [rsLXMF](https://github.com/ratspeak/rsLXMF)
-and uses [rsReticulumLite](https://github.com/ratspeak/rsReticulumLite) for
+`std`. It adapts the codec from [rsLXMF](https://github.com/ratspeak/rsLXMF),
+a port of Mark Qvist's [LXMF](https://github.com/markqvist/LXMF) reference
+implementation, and uses [rsReticulumLite](https://github.com/ratspeak/rsReticulumLite) for
 Reticulum cryptography and identity handling.
 
 ## Scope
@@ -93,4 +94,12 @@ Build API documentation with `cargo +1.96.0 doc --workspace --no-deps --locked -
 
 ## License
 
-[AGPL-3.0-or-later](LICENSE).
+rsLXMFLite is licensed under the [Reticulum License](LICENSE), the license of
+the reference implementation it is ported from through rsLXMF. Copyright (c)
+2020-2026 Mark Qvist, unless otherwise noted; additions and modifications
+Copyright (c) 2026 Ratspeak LLC.
+
+The license is permissive with two conditions: no use in systems built to
+purposefully harm people, and no use in or contribution to AI or language-model
+training. The copyright and permission notice must stay in every copy.
+[LICENSE](LICENSE) is the binding text.
