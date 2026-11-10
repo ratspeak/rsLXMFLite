@@ -11,6 +11,13 @@ use sha2::{Digest, Sha256};
 /// Name key of node announce metadata (`LXMF.PN_META_NAME`).
 pub const PN_META_NAME: u8 = 0x01;
 
+/// Link-request cost a delivery destination announces, 3.25 in fixed point
+/// (`LXMRouter.DELIVERY_LINK_COST`, LXMRouter.py:53, :422@1.3.0).
+pub const DELIVERY_LINK_COST_FP: u16 = 832;
+/// Link-request cost a propagation node announces, 3.25 in fixed point
+/// (`LXMRouter.PROPAGATION_LINK_COST`, LXMRouter.py:54, :634@1.3.0).
+pub const PROPAGATION_LINK_COST_FP: u16 = 832;
+
 /// One bounded `/get` operation. Fetch never includes haves: deleting a remote
 /// copy requires a separate Purge after the embedding storage owner commits it.
 #[derive(Clone, Copy, Debug)]
