@@ -116,7 +116,7 @@ impl From<CryptoError> for LxmfError {
             // mirroring Python's OPPORTUNISTIC -> DIRECT downgrade.
             CryptoError::PlaintextTooLong => LxmfError::TooLong,
             CryptoError::OutputTooSmall => LxmfError::OutputTooSmall,
-            CryptoError::AuthenticationFailed => LxmfError::Crypto,
+            CryptoError::AuthenticationFailed | CryptoError::LowOrderPoint => LxmfError::Crypto,
         }
     }
 }
