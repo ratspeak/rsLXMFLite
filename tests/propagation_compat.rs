@@ -23,80 +23,76 @@ fn announce_matches_trusted_defaults_and_extension_handling() {
             stamp_cost: 16,
             stamp_flex: 3,
             peering_cost: 18,
-            name: Some(b"relay"),
+            name: Some("relay"),
         }
     );
     assert_eq!(
         handlers::parse_pn_announce_data(&data).unwrap().stamp_cost,
         parsed.stamp_cost
     );
-    let mut extended = data.clone();
-    extended[0] = 0x98;
-    extended.extend_from_slice(&[0x92, 0xc0, 0x80]);
-    assert_eq!(parse_node_announce(&extended), Some(parsed));
     for n in 0..data.len() {
         assert!(parse_node_announce(&data[..n]).is_none());
     }
-    let mut trailing = data.clone();
-    trailing.push(0);
-    assert!(parse_node_announce(&trailing).is_none());
 }
 
 #[test]
-fn hostile_announce_fields_fail_closed() {
+fn hostile_announce_fields_match_trusted_coercions() {
     // [false, 1, true, 1, 1, [16, 3, 18], {}]
     let data = [0x97, 0xc2, 1, 0xc3, 1, 1, 0x93, 16, 3, 18, 0x80];
     assert!(parse_node_announce(&data).is_some());
-    for (offset, byte) in [
-        (2, 0xff),
-        (3, 0),
-        (4, 0xff),
-        (6, 0x92),
-        (7, 0xff),
-        (10, 0x90),
-    ] {
-        let mut bad = data;
-        bad[offset] = byte;
-        assert!(parse_node_announce(&bad).is_none(), "offset {offset}");
+    let check = |bad: &[u8]| {
+        let trusted = handlers::parse_pn_announce_data(bad);
+        let ours = parse_node_announce(bad);
+        assert_eq!(
+            node_announce_is_valid(bad),
+            handlers::pn_announce_data_is_valid(bad),
+            "{bad:02x?}"
+        );
+        assert_eq!(ours.is_some(), trusted.is_some(), "{bad:02x?}");
+        if let (Some(ours), Some(trusted)) = (ours, trusted) {
+            assert_eq!(ours.timebase, trusted.timebase);
+            assert_eq!(ours.enabled, trusted.node_state);
+            assert_eq!(ours.transfer_limit_kb, trusted.transfer_limit);
+            assert_eq!(ours.stamp_cost, trusted.stamp_cost);
+        }
+    };
+    for offset in 0..data.len() {
+        for byte in [
+            0x00, 0x01, 0x7f, 0x80, 0x90, 0x92, 0xa0, 0xc0, 0xc1, 0xc2, 0xff,
+        ] {
+            let mut bad = data;
+            bad[offset] = byte;
+            check(&bad);
+        }
     }
-    for number in [f64::NAN, f64::INFINITY, -1.0, 18446744073709551616.0] {
-        let mut bad = data[..4].to_vec();
-        bad.push(0xcb);
-        bad.extend_from_slice(&number.to_be_bytes());
-        bad.extend_from_slice(&data[5..]);
-        assert!(parse_node_announce(&bad).is_none());
+    for number in [f64::NAN, f64::INFINITY, -1.0, 1.25, 18446744073709551616.0] {
+        for slot in [2usize, 4, 7] {
+            let mut bad = data[..slot].to_vec();
+            bad.push(0xcb);
+            bad.extend_from_slice(&number.to_be_bytes());
+            bad.extend_from_slice(&data[slot + 1..]);
+            check(&bad);
+        }
     }
-    let mut fractional = data[..4].to_vec();
-    fractional.push(0xcb);
-    fractional.extend_from_slice(&1.25f64.to_be_bytes());
-    fractional.extend_from_slice(&data[5..]);
-    assert_eq!(
-        parse_node_announce(&fractional).unwrap().transfer_limit_kb,
-        handlers::parse_pn_announce_data(&fractional)
-            .unwrap()
-            .transfer_limit
-    );
     assert!(array_items(&[0xdd, 0xff, 0xff, 0xff, 0xff]).is_err());
     assert!(array_items(&[0x91, 0xc6, 0xff, 0xff, 0xff, 0xff]).is_err());
     let mut nested = vec![0x91; 10];
     nested.push(0xc0);
     assert!(array_items(&nested).is_err());
+    let mut deep = data.to_vec();
+    deep.pop();
+    deep.extend_from_slice(&[0x81, 0x02]);
+    deep.extend_from_slice(&nested);
+    assert!(!node_announce_is_valid(&deep));
 }
 
 #[test]
-fn delivery_cost_distinguishes_unknown_nil_and_integer_without_truncating_overflow() {
+fn delivery_cost_round_trips_trusted_announce_data() {
     for cost in [None, Some(8), Some(16), Some(254)] {
-        assert_eq!(
-            delivery_stamp_cost(&handlers::get_announce_app_data(Some("name"), cost)),
-            Some(cost)
-        );
+        let data = handlers::get_announce_app_data(Some("name"), cost);
+        assert_eq!(delivery_stamp_cost(&data), Some(cost));
+        assert_eq!(handlers::stamp_cost_from_app_data(&data), cost);
     }
-    assert_eq!(delivery_stamp_cost(&[]), None);
-    assert_eq!(delivery_stamp_cost(&[0x91, 0xc0]), None);
-    assert_eq!(delivery_stamp_cost(&[0x92, 0xc0, 0xcd, 1, 0]), None);
-    assert_eq!(delivery_stamp_cost(&[0x92, 0xc0, 0xff]), None);
-    assert_eq!(delivery_stamp_cost(&[0x92, 0xc0, 0xc0]), Some(None));
-    assert_eq!(delivery_stamp_cost(&[0x92, 0xc0, 0]), Some(Some(0)));
 }
 
 #[test]

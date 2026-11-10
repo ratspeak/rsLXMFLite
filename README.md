@@ -23,8 +23,10 @@ message validator. Relay selection and durable inbox acknowledgement remain
 the firmware's responsibility.
 
 Signature validation does not check recipient stamps, message age or replay
-policy. Message parsers ignore the appended stamp and trailing bytes; firmware
-must handle any required stamp and framing policy separately.
+policy. Message parsers decode the appended stamp under Python's decoder rules
+but do not check it, and ignore trailing bytes; firmware must handle any
+required stamp and framing policy separately. Message IDs of stamped messages
+hash the canonical re-encoding of the first four elements, as Python LXMF does.
 
 Incoming message fields can be read without allocation. Full-width signed and
 unsigned integer IDs are preserved; duplicate outer IDs are rejected. Parsers
@@ -36,7 +38,8 @@ is not automatically compatible with firmware. The Link/Resource audio
 builder writes standard LXMF `[mode, binary]` audio fields covered by the message
 signature; the plain text builders write empty fields. The `*_with_fields`
 builders write caller-encoded fields (for example `FIELD_RESULTS`) for Link and
-opportunistic delivery, byte-identical to the full Rust codec. Recipient stamps
+opportunistic delivery in canonical MessagePack form, byte-identical to the
+full Rust codec; values Python's decoder rejects are refused. Recipient stamps
 come from a remembered `FIELD_TICKET` (`ticket_stamp`) or from proof of work;
 `seal_opportunistic` encrypts a stamped message into a single packet. Audio framing is
 separate from codec support, playback and application size/duration limits.

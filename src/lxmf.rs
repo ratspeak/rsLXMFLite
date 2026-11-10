@@ -14,18 +14,21 @@
 //! With fixed identities, timestamp and message data, the plaintext is deterministic.
 //!
 //! Text builders emit empty `fields`; audio Link/Resource builders emit native
-//! `FIELD_AUDIO`; `*_with_fields` builders emit caller-encoded entries. Parsers tolerate
-//! non-empty fields and a trailing stamp element outside the signed region. Parsers validate the
-//! first four elements; they do not validate or expose the stamp, later elements or trailing bytes.
+//! `FIELD_AUDIO`; `*_with_fields` builders emit caller-supplied values in the
+//! canonical form Python's packer produces. Parsers decode every array element
+//! with the acceptance rules of Python's decoder (no duplicate or unhashable map
+//! keys at any depth, valid UTF-8 strings, no `0xc1`) and ignore bytes after the
+//! array. They do not expose the stamp or later elements.
 //!
 //! Notes / known limitations:
-//! - **MessagePack profile.** Parsing requires a fixarray with at least four elements
-//!   and a float64 timestamp. Title/content accept bin or str; interpreted field maps
-//!   have at most 64 unique integer keys. The hash retains the first four encoded
-//!   values and forces the array marker to `0x94`, without canonical re-encoding.
-//!   Python re-encodes these values when stripping a stamp, so a stamped message
-//!   using different integer/string encodings may produce a different message ID.
-//!   Do not assume every message accepted by another LXMF implementation is accepted here.
+//! - **Message ID.** With four elements the ID hashes the payload as received.
+//!   With a stamp it hashes `0x94` and the canonical re-encoding of the first four
+//!   elements, as Python's `unpack_from_bytes` does.
+//! - **MessagePack profile.** Parsing requires an array with at least four
+//!   elements and a float64 timestamp. Title/content accept bin or str; field
+//!   maps have at most 64 unique integer keys and every map at most 64 entries;
+//!   nesting is limited to depth 8 and extension types are refused. Do not assume
+//!   every message accepted by another LXMF implementation is accepted here.
 //! - **Application policy.** A valid signature does not establish stamp cost, freshness,
 //!   replay protection or valid media content. The embedding runtime enforces those checks.
 //! - **Ratchets:** the `*_ratchet` variants decrypt via the retained ring
@@ -42,6 +45,8 @@ use rns_lite_core::identity::{
     LXMF_DELIVERY_NAME, LocalIdentity, destination_hash_from_parts, identity_hash, name_hash,
 };
 use rns_lite_core::wire::sha256;
+
+use crate::canonical::{self, Discard, Sink};
 
 pub const LXMF_DEST_LENGTH: usize = 16;
 pub const LXMF_SIGNATURE_LENGTH: usize = 64;
@@ -60,8 +65,9 @@ pub const MAX_FIELDS: usize = 64;
 
 /// One caller-encoded outer field: `(id, exactly one complete MessagePack value)`.
 ///
-/// The value bytes are written verbatim, as `lxmf_core` `set_msgpack_field`
-/// does. Encode a raw byte string as MessagePack bin to match `set_field`.
+/// The value is written in canonical form (minimal integers and headers, f64
+/// floats), as `lxmf_core` `set_msgpack_field` stores it. Encode a raw byte
+/// string as MessagePack bin to match `set_field`.
 pub type EncodedField<'a> = (u8, &'a [u8]);
 
 /// Standard `[mode, binary]` audio, borrowed without decoding or allocation.
@@ -168,6 +174,14 @@ impl PayloadWriter for SizeWriter {
     }
 }
 
+/// Canonical MessagePack bytes written through a payload writer.
+struct WriterSink<'w, W>(&'w mut W);
+impl<W: PayloadWriter> Sink for WriterSink<'_, W> {
+    fn put(&mut self, bytes: &[u8]) -> Result<(), LxmfError> {
+        self.0.write(bytes)
+    }
+}
+
 fn write_bin<W: PayloadWriter>(writer: &mut W, field: W::Field) -> Result<(), LxmfError> {
     let length = W::field_len(&field);
     if length <= u8::MAX as usize {
@@ -229,7 +243,7 @@ fn write_payload<W: PayloadWriter>(
         }
         PayloadFields::Encoded(entries, present) => {
             // Donor: lxmf-core LxMessageDraft::write_payload. Its BTreeMap emits
-            // ascending ids as minimal uints followed by the verbatim value bytes.
+            // ascending ids as minimal uints followed by the canonical value bytes.
             write_fields_header(writer, entries.len())?;
             for id in 0..=u8::MAX {
                 if present[usize::from(id / 8)] & (1 << (id % 8)) == 0 {
@@ -242,7 +256,7 @@ fn write_payload<W: PayloadWriter>(
                 }
                 for &(entry_id, value) in entries {
                     if entry_id == id {
-                        writer.write(value)?;
+                        canonical::walk(value, 0, 1, &mut WriterSink(&mut *writer))?;
                     }
                 }
             }
@@ -253,10 +267,11 @@ fn write_payload<W: PayloadWriter>(
 
 /// Check caller-encoded entries; returns the bitset of present ids.
 ///
-/// Mirrors `lxmf_core::message::EncodedFieldValue::new` (one complete value,
-/// no trailing bytes) within this crate's parser profile: at most 64 entries,
-/// nesting accepted by the inbound validator, no extension types. Ids must be
-/// unique; the trusted draft's replace-on-set has no slice equivalent.
+/// Mirrors `lxmf_core::message::EncodedFieldValue::canonical` (exactly one
+/// value that Python's decoder accepts) within this crate's parser profile: at
+/// most 64 entries per map, nesting accepted by the inbound validator, no
+/// extension types. Ids must be unique; the trusted draft's replace-on-set has
+/// no slice equivalent.
 fn encoded_field_set(fields: &[EncodedField<'_>]) -> Result<[u8; 32], LxmfError> {
     if fields.len() > MAX_FIELDS {
         return Err(LxmfError::TooManyFields);
@@ -269,7 +284,7 @@ fn encoded_field_set(fields: &[EncodedField<'_>]) -> Result<[u8; 32], LxmfError>
         }
         present[byte] |= bit;
         // Depth 1: the inbound parser walks values one level below the fields map.
-        if skip_value(value, 0, 1)? != value.len() {
+        if canonical::walk(value, 0, 1, &mut Discard)? != value.len() {
             return Err(LxmfError::MalformedPayload);
         }
     }
@@ -653,12 +668,14 @@ pub fn build_opportunistic_ratchet(
 /// [`FIELD_RESULTS`]), encrypted to the recipient's base identity key.
 ///
 /// Entries may be given in any order; they are written in ascending id order,
-/// byte-identical to `lxmf_core` `LxMessageDraft::set_msgpack_field` for the
-/// same ids and values. Rejected: more than [`MAX_FIELDS`] entries
+/// each value re-encoded canonically while it is written (no buffer), so the
+/// output is byte-identical to `lxmf_core` `LxMessageDraft::set_msgpack_field`
+/// for the same ids and values. Rejected: more than [`MAX_FIELDS`] entries
 /// (`TooManyFields`), a repeated id (`DuplicateField`), or a value that is not
-/// exactly one complete MessagePack object within the parser's nesting limit
-/// (`MalformedPayload`). A message larger than one packet is `TooLong`; send it
-/// over a Link with [`build_link_with_fields`] instead.
+/// exactly one MessagePack object Python's decoder accepts within the parser's
+/// profile (`MalformedPayload`; a nested map over 64 entries is `TooManyFields`).
+/// A message larger than one packet is `TooLong`; send it over a Link with
+/// [`build_link_with_fields`] instead.
 ///
 /// No stamp is attached. For a recipient stamp, use [`build_link_with_fields`],
 /// [`crate::propagation::append_recipient_stamp`] and [`seal_opportunistic`].
@@ -967,67 +984,104 @@ fn parse_decrypted<'a>(
     field_scratch: &mut LxmfFieldScratch,
 ) -> Result<LxmfView<'a>, LxmfError> {
     let plaintext = &scratch[..pt_len];
-
     // plaintext = source_hash(16) || signature(64) || payload
     if plaintext.len() < PLAINTEXT_PREFIX + 1 {
         return Err(LxmfError::MalformedPayload);
     }
-    let mut source_hash = [0u8; LXMF_DEST_LENGTH];
-    source_hash.copy_from_slice(&plaintext[..16]);
-    let mut signature = [0u8; LXMF_SIGNATURE_LENGTH];
-    signature.copy_from_slice(&plaintext[16..80]);
-    let payload = &plaintext[80..];
+    let signature: &[u8; LXMF_SIGNATURE_LENGTH] = plaintext[16..80].try_into().unwrap();
+    // Canonical re-encoding at most doubles a payload (float32 widens 5 -> 9 bytes).
+    let mut work = [0u8; 2 * LXMF_DEST_LENGTH + 2 * MAX_LXMF_PAYLOAD + MESSAGE_ID_LENGTH];
+    verify_message(
+        &me.lxmf_delivery_hash(),
+        plaintext[..16].try_into().unwrap(),
+        signature,
+        &plaintext[80..],
+        source_public_key,
+        &mut work,
+        field_scratch,
+    )
+}
 
-    // Bind source_hash to the supplied source public key (its lxmf.delivery dest).
+/// Bind the source, decode the payload under Python's decoder rules and check
+/// the signature over the bytes Python hashes: the payload as received, or
+/// `0x94` and the canonical first four elements when a stamp is present.
+/// `work` holds `dest || source || hashed payload || message id`.
+fn verify_message<'a>(
+    dest_hash: &[u8; LXMF_DEST_LENGTH],
+    source_hash: [u8; LXMF_DEST_LENGTH],
+    signature: &[u8; LXMF_SIGNATURE_LENGTH],
+    payload: &'a [u8],
+    source_public_key: &[u8; 64],
+    work: &mut [u8],
+    field_scratch: &mut LxmfFieldScratch,
+) -> Result<LxmfView<'a>, LxmfError> {
     let nh = name_hash(LXMF_DELIVERY_NAME);
     let src_id_hash = identity_hash(source_public_key);
     if destination_hash_from_parts(&nh, Some(&src_id_hash)) != source_hash {
         return Err(LxmfError::SourceHashMismatch);
     }
 
-    // Decode the array: [timestamp, title, content, fields, (stamp)?]. Strip the stamp for hashing.
-    if payload.is_empty() || payload[0] & 0xf0 != 0x90 {
+    // [timestamp, title, content, fields, stamp?, ...]; any array header.
+    let (canonical::Head::Array { count, first }, _) = canonical::head(payload, 0)? else {
+        return Err(LxmfError::MalformedPayload);
+    };
+    if count < 4 || payload.get(first) != Some(&0xcb) {
         return Err(LxmfError::MalformedPayload);
     }
-    let n_elems = (payload[0] & 0x0f) as usize;
-    if n_elems < 4 {
-        return Err(LxmfError::MalformedPayload);
-    }
-    if payload.len() < 10 || payload[1] != 0xcb {
-        return Err(LxmfError::MalformedPayload);
-    }
-    let timestamp = f64::from_be_bytes(payload[2..10].try_into().unwrap());
-    let (title, after_title) = read_bin(payload, 10)?;
+    let timestamp = f64::from_be_bytes(
+        payload
+            .get(first + 1..first + 9)
+            .ok_or(LxmfError::MalformedPayload)?
+            .try_into()
+            .unwrap(),
+    );
+    let (title, after_title) = read_bin(payload, first + 9)?;
+    canonical::walk(payload, first + 9, 0, &mut Discard)?;
     let (content, after_content) = read_bin(payload, after_title)?;
-    let after_fields = skip_value(payload, after_content, 0)?; // element 4 (fields)
-    validate_fields(&payload[after_content..after_fields], field_scratch)?;
-
-    // The 4-element payload used for hashing (Python strips the stamp and re-packs as 4 elements):
-    // bytes [0..after_fields] with the array marker forced to 0x94.
-    let mut payload4 = [0u8; MAX_LXMF_PAYLOAD];
-    let p4_len = after_fields;
-    if p4_len > MAX_LXMF_PAYLOAD {
-        return Err(LxmfError::MalformedPayload);
+    canonical::walk(payload, after_title, 0, &mut Discard)?;
+    let after_fields = skip_value(payload, after_content, 0)?;
+    let fields = &payload[after_content..after_fields];
+    validate_fields(fields, field_scratch)?;
+    canonical::walk(payload, after_content, 0, &mut Discard)?;
+    // Python decodes every element; bytes after the array are ignored.
+    let mut end = after_fields;
+    for _ in 4..count {
+        end = canonical::walk(payload, end, 0, &mut Discard)?;
     }
-    payload4[..p4_len].copy_from_slice(&payload[..p4_len]);
-    payload4[0] = 0x94;
 
-    // hashed_part = my_dest || source || payload4 ; hash ; signed_part = hashed_part || hash
-    let my_dest = me.lxmf_delivery_hash();
-    let mut signed = [0u8; LXMF_DEST_LENGTH * 2 + MAX_LXMF_PAYLOAD + MESSAGE_ID_LENGTH];
-    signed[..16].copy_from_slice(&my_dest);
-    signed[16..32].copy_from_slice(&source_hash);
-    signed[32..32 + p4_len].copy_from_slice(&payload4[..p4_len]);
-    let hashed_len = 32 + p4_len;
-    let hash = sha256(&signed[..hashed_len]);
-    signed[hashed_len..hashed_len + 32].copy_from_slice(&hash);
+    let hashed_len = if count == 4 {
+        payload.len()
+    } else {
+        let mut size = SizeWriter(1);
+        for start in [first, first + 9, after_title, after_content] {
+            canonical::walk(payload, start, 0, &mut WriterSink(&mut size))?;
+        }
+        size.0
+    };
+    let signed_len = 2 * LXMF_DEST_LENGTH + hashed_len + MESSAGE_ID_LENGTH;
+    if work.len() < signed_len {
+        return Err(LxmfError::OutputTooSmall);
+    }
+    work[..16].copy_from_slice(dest_hash);
+    work[16..32].copy_from_slice(&source_hash);
+    if count == 4 {
+        work[32..32 + hashed_len].copy_from_slice(payload);
+    } else {
+        let mut writer = SliceWriter {
+            output: &mut work[32..32 + hashed_len],
+            position: 0,
+        };
+        writer.write(&[0x94])?;
+        for start in [first, first + 9, after_title, after_content] {
+            canonical::walk(payload, start, 0, &mut WriterSink(&mut writer))?;
+        }
+    }
+    let hash = sha256(&work[..32 + hashed_len]);
+    work[32 + hashed_len..signed_len].copy_from_slice(&hash);
 
-    // Verify the Ed25519 signature with the source identity's ed25519 public key.
-    let mut ed_pub = [0u8; 32];
-    ed_pub.copy_from_slice(&source_public_key[32..]);
+    let ed_pub: [u8; 32] = source_public_key[32..].try_into().unwrap();
     let key = VerifyingKey::from_bytes(&ed_pub).map_err(|_| LxmfError::SignatureInvalid)?;
-    let sig = Signature::from_bytes(&signature);
-    key.verify(&signed[..hashed_len + 32], &sig)
+    key.verify(&work[..signed_len], &Signature::from_bytes(signature))
         .map_err(|_| LxmfError::SignatureInvalid)?;
 
     Ok(LxmfView {
@@ -1036,7 +1090,7 @@ fn parse_decrypted<'a>(
         timestamp,
         title,
         content,
-        fields: &payload[after_content..after_fields],
+        fields,
     })
 }
 
@@ -1241,7 +1295,10 @@ fn build_link_inner(
 /// (`DestinationMismatch` otherwise); `source_public_key` is recalled by the caller from
 /// `data[16..32]`. Same stamp-strip + signature semantics as [`parse_opportunistic`]
 /// (including the limits in [`crate::lxmf`]). `scratch` is working memory for the
-/// hashed/signed region and must be at least `64 + payload` bytes (size it to `data.len()`).
+/// hashed/signed region: `64 + payload` bytes, or `64 +` the canonical first four
+/// elements when a stamp is present. `data.len()` suffices unless a stamped
+/// message uses non-canonical encodings (float32 widens most: size it to
+/// `2 * data.len()` to accept any such message); a short scratch is `OutputTooSmall`.
 pub fn parse_link<'a>(
     me: &LocalIdentity,
     data: &'a [u8],
@@ -1257,62 +1314,15 @@ pub fn parse_link<'a>(
     if dest_hash != me.lxmf_delivery_hash() {
         return Err(LxmfError::DestinationMismatch);
     }
-    let mut source_hash = [0u8; LXMF_DEST_LENGTH];
-    source_hash.copy_from_slice(&data[16..32]);
-    let mut signature = [0u8; LXMF_SIGNATURE_LENGTH];
-    signature.copy_from_slice(&data[32..96]);
-    let payload = &data[96..];
-
-    // Bind source_hash to the supplied source public key (its lxmf.delivery dest).
-    let nh = name_hash(LXMF_DELIVERY_NAME);
-    let src_id_hash = identity_hash(source_public_key);
-    if destination_hash_from_parts(&nh, Some(&src_id_hash)) != source_hash {
-        return Err(LxmfError::SourceHashMismatch);
-    }
-
-    // Decode [timestamp, title, content, fields, (stamp)?]; strip the stamp for hashing.
-    if payload.is_empty() || payload[0] & 0xf0 != 0x90 {
-        return Err(LxmfError::MalformedPayload);
-    }
-    if (payload[0] & 0x0f) < 4 {
-        return Err(LxmfError::MalformedPayload);
-    }
-    if payload.len() < 10 || payload[1] != 0xcb {
-        return Err(LxmfError::MalformedPayload);
-    }
-    let timestamp = f64::from_be_bytes(payload[2..10].try_into().unwrap());
-    let (title, after_title) = read_bin(payload, 10)?;
-    let (content, after_content) = read_bin(payload, after_title)?;
-    let after_fields = skip_value(payload, after_content, 0)?; // element 4 (fields)
-    validate_fields(&payload[after_content..after_fields], field_scratch)?;
-
-    // scratch = dest || source || payload4(marker forced 0x94) || hash; verify over it.
-    let p4_len = after_fields;
-    if scratch.len() < 64 + p4_len {
-        return Err(LxmfError::OutputTooSmall);
-    }
-    scratch[..16].copy_from_slice(&dest_hash);
-    scratch[16..32].copy_from_slice(&source_hash);
-    scratch[32..32 + p4_len].copy_from_slice(&payload[..p4_len]);
-    scratch[32] = 0x94;
-    let hash = sha256(&scratch[..32 + p4_len]);
-    scratch[32 + p4_len..64 + p4_len].copy_from_slice(&hash);
-
-    let mut ed_pub = [0u8; 32];
-    ed_pub.copy_from_slice(&source_public_key[32..]);
-    let key = VerifyingKey::from_bytes(&ed_pub).map_err(|_| LxmfError::SignatureInvalid)?;
-    let sig = Signature::from_bytes(&signature);
-    key.verify(&scratch[..64 + p4_len], &sig)
-        .map_err(|_| LxmfError::SignatureInvalid)?;
-
-    Ok(LxmfView {
-        message_id: hash,
-        source_hash,
-        timestamp,
-        title,
-        content,
-        fields: &payload[after_content..after_fields],
-    })
+    verify_message(
+        &dest_hash,
+        data[16..32].try_into().unwrap(),
+        data[32..96].try_into().unwrap(),
+        &data[96..],
+        source_public_key,
+        scratch,
+        field_scratch,
+    )
 }
 
 // ---- fields helpers (lazy decode of the raw `fields` element) ----

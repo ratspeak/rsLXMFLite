@@ -2,9 +2,14 @@
 //! Rust owns wire validation; discovery, scheduling and persistence belong to
 //! the embedding runtime. No allocation or propagation-node server is provided.
 
-use crate::lxmf::{LXMF_PACKED_PREFIX, LxmfError, field_value, skip_value, value_as_bytes};
+use crate::canonical::{self, Discard, Head};
+use crate::lxmf::{LXMF_PACKED_PREFIX, LxmfError, skip_value, value_as_bytes};
+use crate::pyvalue;
 use rns_lite_core::{crypto, identity::identity_hash};
 use sha2::{Digest, Sha256};
+
+/// Name key of node announce metadata (`LXMF.PN_META_NAME`).
+pub const PN_META_NAME: u8 = 0x01;
 
 /// One bounded `/get` operation. Fetch never includes haves: deleting a remote
 /// copy requires a separate Purge after the embedding storage owner commits it.
@@ -129,17 +134,20 @@ pub fn fetched_message(data: &[u8]) -> Result<Option<&[u8]>, LxmfError> {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NodeAnnounce<'a> {
-    pub timebase: u64,
+    /// Python `int()` of the timebase, clamped to the `i64` range.
+    pub timebase: i64,
     pub enabled: bool,
-    /// Decimal kilobytes. The caller must check conversion to its local byte
-    /// and buffer limits; a valid `u64` value need not fit a 32-bit device.
+    /// Decimal kilobytes, below zero clamped to zero. The caller must check
+    /// conversion to its local byte and buffer limits; a valid `u64` value need
+    /// not fit a 32-bit device.
     pub transfer_limit_kb: u64,
     pub sync_limit_kb: u64,
+    /// Integer costs, clamped to `0..=255`; fractional slot 7 costs are not read.
     pub stamp_cost: u8,
     pub stamp_flex: u8,
     pub peering_cost: u8,
-    /// Raw advertised name. The UI must sanitize and bound it before display.
-    pub name: Option<&'a [u8]>,
+    /// Advertised name as [`node_announce_name`] returns it.
+    pub name: Option<&'a str>,
 }
 
 /// Validate one complete array using the supported MessagePack value types.
@@ -196,97 +204,162 @@ impl<'a> Iterator for ArrayItems<'a> {
 
 impl ExactSizeIterator for ArrayItems<'_> {}
 
-fn unsigned(data: &[u8]) -> Option<u64> {
-    match *data.first()? {
-        b @ 0x00..=0x7f => Some(u64::from(b)),
-        0xcc => Some(u64::from(*data.get(1)?)),
-        0xcd => Some(u64::from(u16::from_be_bytes(
-            data.get(1..3)?.try_into().ok()?,
-        ))),
-        0xce => Some(u64::from(u32::from_be_bytes(
-            data.get(1..5)?.try_into().ok()?,
-        ))),
-        0xcf => Some(u64::from_be_bytes(data.get(1..9)?.try_into().ok()?)),
-        0xd0 => u64::try_from(*data.get(1)? as i8).ok(),
-        0xd1 => u64::try_from(i16::from_be_bytes(data.get(1..3)?.try_into().ok()?)).ok(),
-        0xd2 => u64::try_from(i32::from_be_bytes(data.get(1..5)?.try_into().ok()?)).ok(),
-        0xd3 => u64::try_from(i64::from_be_bytes(data.get(1..9)?.try_into().ok()?)).ok(),
-        0xca | 0xcb => {
-            let number = if data[0] == 0xca {
-                f32::from_be_bytes(data.get(1..5)?.try_into().ok()?) as f64
-            } else {
-                f64::from_be_bytes(data.get(1..9)?.try_into().ok()?)
-            };
-            // Avoid Rust's saturating float cast accepting NaN/infinity/overflow.
-            (number.is_finite() && (0.0..18446744073709551616.0).contains(&number))
-                .then_some(number as u64)
-        }
+/// The leading value under Python's decoder rules; later bytes are ignored, as
+/// `umsgpack.unpackb` ignores them.
+fn decode_python(data: &[u8]) -> Option<Head<'_>> {
+    canonical::walk(data, 0, 0, &mut Discard).ok()?;
+    canonical::head(data, 0).ok().map(|(head, _)| head)
+}
+
+/// Python `float()` succeeds on the first three items of a list.
+fn floats(data: &[u8], list: Head<'_>) -> Option<()> {
+    if !matches!(list, Head::Array { .. }) {
+        return None;
+    }
+    for i in 0..3 {
+        pyvalue::float_ok(pyvalue::index(data, list, i)?).then_some(())?;
+    }
+    Some(())
+}
+
+/// The decoded announce when Python `pn_announce_data_is_valid` accepts it.
+fn valid_node_announce(data: &[u8]) -> Option<Head<'_>> {
+    let value = decode_python(data)?;
+    let length = pyvalue::len(data, value)?;
+    if length < 7 {
+        return None;
+    }
+    let at = |i| pyvalue::index(data, value, i);
+    pyvalue::int(at(1)?)?;
+    pyvalue::bool_state(at(2)?)?;
+    pyvalue::int(at(3)?)?;
+    pyvalue::int(at(4)?)?;
+    floats(data, at(5)?)?;
+    if !matches!(at(6)?, Head::Map { .. }) {
+        return None;
+    }
+    if length > 7 {
+        floats(data, at(7)?)?;
+    }
+    Some(value)
+}
+
+/// Python `pn_announce_data_is_valid`, including its `int()`/`float()`
+/// coercions and the transitional slot 7 check. Within this crate's
+/// MessagePack profile: nesting depth 8, 64 entries per map, no extension types.
+pub fn node_announce_is_valid(data: &[u8]) -> bool {
+    valid_node_announce(data).is_some()
+}
+
+/// Python `pn_name_from_app_data`: the raw UTF-8 binary name metadata of valid
+/// node announce data. It is not filtered; sanitize and bound it before display.
+pub fn node_announce_name(data: &[u8]) -> Option<&str> {
+    let value = valid_node_announce(data)?;
+    let metadata = pyvalue::index(data, value, 6)?;
+    match pyvalue::index(data, metadata, usize::from(PN_META_NAME))? {
+        Head::Bin(bytes) => core::str::from_utf8(bytes).ok(),
         _ => None,
     }
 }
 
-/// Parse node app data after the caller authenticates and binds the announce.
-/// Finite nonnegative numeric fields are truncated toward zero; timebases above
-/// `i64::MAX` and byte-limit arithmetic overflow are rejected. Optional name
-/// metadata can be ignored when its field-map profile is unsupported.
+/// Parse node app data that [`node_announce_is_valid`] accepts, after the
+/// caller authenticates and binds the announce. Values are extracted with
+/// Python `int()` as the upstream announce handler does, and `None` is
+/// returned where that conversion raises. Bytes after the array are ignored.
 pub fn parse_node_announce(data: &[u8]) -> Option<NodeAnnounce<'_>> {
-    let mut items = array_items(data).ok()?;
-    if items.len() < 7 {
-        return None;
-    }
-    items.next()?; // Legacy flag is ignored by the current protocol.
-    let timebase = unsigned(items.next()?)?;
-    if timebase > i64::MAX as u64 {
-        return None;
-    }
-    let enabled = match items.next()? {
-        [0xc2] => false,
-        [0xc3] => true,
-        _ => return None,
-    };
-    let transfer_limit_kb = unsigned(items.next()?)?;
-    let sync_limit_kb = unsigned(items.next()?)?;
-    // Runtime byte-limit conversion must never wrap on a 32-bit MCU.
-    transfer_limit_kb.checked_mul(1000)?;
-    sync_limit_kb.checked_mul(1000)?;
-    let mut costs = array_items(items.next()?).ok()?;
-    if costs.len() < 3 {
-        return None;
-    }
-    let stamp_cost = u8::try_from(unsigned(costs.next()?)?).ok()?;
-    let stamp_flex = u8::try_from(unsigned(costs.next()?)?).ok()?;
-    let peering_cost = u8::try_from(unsigned(costs.next()?)?).ok()?;
-    let metadata = items.next()?;
-    if !matches!(metadata.first(), Some(0x80..=0x8f | 0xde | 0xdf)) {
-        return None;
-    }
-    let name = field_value(metadata, 1).and_then(value_as_bytes);
+    let value = valid_node_announce(data)?;
+    let int_at = |i| pyvalue::int(pyvalue::index(data, value, i)?);
+    let limit = |raw: i128| raw.clamp(0, i128::from(u64::MAX)) as u64;
+    let costs = pyvalue::index(data, value, 5)?;
+    let cost = |i| Some(pyvalue::int(pyvalue::index(data, costs, i)?)?.clamp(0, 255) as u8);
     Some(NodeAnnounce {
-        timebase,
-        enabled,
-        transfer_limit_kb,
-        sync_limit_kb,
-        stamp_cost,
-        stamp_flex,
-        peering_cost,
-        name,
+        timebase: int_at(1)?.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64,
+        enabled: pyvalue::bool_state(pyvalue::index(data, value, 2)?)?,
+        transfer_limit_kb: limit(int_at(3)?),
+        sync_limit_kb: limit(int_at(4)?),
+        stamp_cost: cost(0)?,
+        stamp_flex: cost(1)?,
+        peering_cost: cost(2)?,
+        name: node_announce_name(data),
     })
 }
 
-/// `None` means unknown/malformed metadata; `Some(None)` is a known nil cost.
-/// Never interpret absent or malformed metadata as free delivery.
-pub fn delivery_stamp_cost(data: &[u8]) -> Option<Option<u8>> {
-    let mut items = array_items(data).ok()?;
-    items.next()?;
-    let cost = items.next()?;
-    if cost == [0xc0] {
-        Some(None)
+/// First byte of the MessagePack delivery-announce format (fixarray or
+/// array16); anything else is the original raw-name format.
+fn is_announce_array_marker(byte: u8) -> bool {
+    matches!(byte, 0x90..=0x9f | 0xdc)
+}
+
+/// Python `display_name_from_app_data`, copied into `out`: the name with NUL
+/// characters and surrounding whitespace removed, or the whole original-format
+/// data when it is UTF-8. `Ok(None)` where Python returns `None`; `OutputTooSmall`
+/// when the name does not fit (it is never longer than `data`). The name is
+/// not filtered; sanitize and bound it before display.
+pub fn display_name<'o>(data: &[u8], out: &'o mut [u8]) -> Result<Option<&'o str>, LxmfError> {
+    let Some(&first) = data.first() else {
+        return Ok(None);
+    };
+    let strip_nul = is_announce_array_marker(first);
+    let name = if strip_nul {
+        let Some(list) = decode_python(data) else {
+            return Ok(None);
+        };
+        // A str element has no .decode() in Python and yields None.
+        let Some(Head::Bin(bytes)) = pyvalue::index(data, list, 0) else {
+            return Ok(None);
+        };
+        let Ok(text) = core::str::from_utf8(bytes) else {
+            return Ok(None);
+        };
+        // Trimming NULs with the whitespace equals Python's replace-then-strip.
+        text.trim_matches(|c| c == '\0' || pyvalue::is_python_space(c))
     } else {
-        // Delivery costs are integer-only in the trusted delivery parser.
-        if matches!(cost.first(), Some(0xca | 0xcb)) {
-            return None;
+        match core::str::from_utf8(data) {
+            Ok(text) => text,
+            Err(_) => return Ok(None),
         }
-        Some(Some(u8::try_from(unsigned(cost)?).ok()?))
+    };
+    let mut length = 0;
+    for chunk in name.split(|c| strip_nul && c == '\0') {
+        let end = length + chunk.len();
+        out.get_mut(length..end)
+            .ok_or(LxmfError::OutputTooSmall)?
+            .copy_from_slice(chunk.as_bytes());
+        length = end;
+    }
+    // UTF-8 pieces split at an ASCII NUL join to UTF-8.
+    Ok(core::str::from_utf8(&out[..length]).ok())
+}
+
+/// Python `stamp_cost_from_app_data` for delivery announces, as the trusted
+/// helper returns it: element 3 when it is an integer, else element 1.
+///
+/// `Some(None)` is where the upstream handler records no cost: a nil cost,
+/// empty or original-format data, or a list shorter than two. `None` means
+/// unknown: undecodable data, or a cost that is not an integer in `0..=255`
+/// (fractional costs are not read). Never interpret `None` as free delivery.
+pub fn delivery_stamp_cost(data: &[u8]) -> Option<Option<u8>> {
+    let Some(&first) = data.first() else {
+        return Some(None);
+    };
+    if !is_announce_array_marker(first) {
+        return Some(None);
+    }
+    let list = decode_python(data)?;
+    let length = pyvalue::len(data, list)?;
+    if length < 2 {
+        return Some(None);
+    }
+    let cost = match pyvalue::index(data, list, 3) {
+        Some(Head::Int(n)) => Head::Int(n),
+        _ => pyvalue::index(data, list, 1)?,
+    };
+    match cost {
+        Head::Nil => Some(None),
+        Head::Int(n) => Some(Some(u8::try_from(n).ok()?)),
+        // Integral floats only (`no_std` has no `fract`); NaN and infinities fail.
+        Head::Float(f) if (f as i64) as f64 == f => Some(Some(u8::try_from(f as i64).ok()?)),
+        _ => None,
     }
 }
 

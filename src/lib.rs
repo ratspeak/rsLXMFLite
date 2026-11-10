@@ -12,8 +12,10 @@
 #[cfg(test)]
 extern crate std;
 
+mod canonical;
 pub mod lxmf;
 pub mod propagation;
+mod pyvalue;
 pub mod stamp;
 
 pub use lxmf::{

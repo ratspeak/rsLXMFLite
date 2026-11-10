@@ -157,10 +157,12 @@ fn field_builders_are_byte_exact_with_trusted_set_msgpack_field() {
                 &mut LxmfFieldScratch::new(),
             )
             .unwrap();
-            for &(field, value) in &fields {
-                assert_eq!(field_value(view.fields, field), Some(value));
-            }
             let unpacked = LxMessage::unpack(&packed).unwrap();
+            for &(field, _) in &fields {
+                // The canonical value the trusted draft stored, not the caller's encoding.
+                let canonical = unpacked.fields().get(field).unwrap().encoded();
+                assert_eq!(field_value(view.fields, field), Some(canonical));
+            }
             assert!(unpacked.verify_signature(&signing_key(&NODE).public_key()));
             assert_eq!(unpacked.fields().len(), fields.len());
         }
