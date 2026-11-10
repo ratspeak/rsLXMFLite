@@ -165,7 +165,7 @@ fn stamped_propagation_retains_audio_and_the_authenticated_id() {
             let (_, entries) = LxMessage::unpack_propagation_wrapper(&buffer[..wrapped]).unwrap();
             assert_eq!(&entries[0][..encrypted_len], encrypted);
             assert_eq!(
-                lxmf_core::stamper::validate_pn_stamp(&entries[0], 0)
+                lxmf_core::stamper::validate_pn_stamp(&entries[0], 0.0)
                     .unwrap()
                     .0,
                 tid

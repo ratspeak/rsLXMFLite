@@ -8,7 +8,7 @@ use rns_lite_core::identity::LocalIdentity;
 
 #[test]
 fn announce_matches_trusted_defaults_and_extension_handling() {
-    let mut node = handlers::PropagationNodeAnnounceData::new(true, 256, 10240, 16, 3, 18);
+    let mut node = handlers::PropagationNodeAnnounceData::new(true, 256, 10240, 16.25, 3.0, 18.5);
     node.timebase = 1234567890;
     node.set_name("relay");
     let data = handlers::get_propagation_node_app_data(&node);
@@ -20,9 +20,9 @@ fn announce_matches_trusted_defaults_and_extension_handling() {
             enabled: true,
             transfer_limit_kb: 256,
             sync_limit_kb: 10240,
-            stamp_cost: 16,
-            stamp_flex: 3,
-            peering_cost: 18,
+            stamp_cost: 16.25,
+            stamp_flex: 3.0,
+            peering_cost: 18.5,
             name: Some("relay"),
         }
     );
@@ -88,7 +88,7 @@ fn hostile_announce_fields_match_trusted_coercions() {
 
 #[test]
 fn delivery_cost_round_trips_trusted_announce_data() {
-    for cost in [None, Some(8), Some(16), Some(254)] {
+    for cost in [None, Some(8.0), Some(8.5), Some(99.75)] {
         let data = handlers::get_announce_app_data(Some("name"), cost);
         assert_eq!(delivery_stamp_cost(&data), Some(cost));
         assert_eq!(handlers::stamp_cost_from_app_data(&data), cost);
@@ -175,7 +175,7 @@ fn recipient_stamp_and_propagation_envelope_preserve_signed_message() {
             assert_eq!(&entries[0][..encrypted_len], encrypted);
             assert_eq!(&entries[0][encrypted_len..], &[0; 32]);
             assert_eq!(
-                lxmf_core::stamper::validate_pn_stamp(&entries[0], 0)
+                lxmf_core::stamper::validate_pn_stamp(&entries[0], 0.0)
                     .unwrap()
                     .0,
                 tid

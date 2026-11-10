@@ -11,7 +11,7 @@
 
 use hkdf::Hkdf;
 use rns_lite_core::stamps::{
-    STAMP_COST_CAP_FP, StampError, StampTarget, stamp_hash, stamp_value_fp_from_hash,
+    COST_FP, STAMP_COST_CAP_FP, StampError, StampTarget, stamp_hash, stamp_value_fp_from_hash,
     target_from_fp,
 };
 use sha2::{Digest, Sha256};
@@ -31,6 +31,33 @@ pub fn ticket_stamp(ticket: &[u8; TICKET_LENGTH], message_id: &[u8; 32]) -> [u8;
     let mut stamp = [0; TICKET_LENGTH];
     stamp.copy_from_slice(&digest[..TICKET_LENGTH]);
     stamp
+}
+
+/// Python `RNS.Stamps.cost_to_fp`: `floor(cost * 256 + 0.5)` clamped to
+/// `0..=25600`. `None` where the scaled cost is not finite, as the trusted
+/// `cost_to_fp` refuses it.
+pub fn cost_to_fp(cost: f64) -> Option<u16> {
+    let scaled = cost * f64::from(COST_FP) + 0.5;
+    if !scaled.is_finite() {
+        return None;
+    }
+    // Truncation equals floor once negatives are clamped to zero.
+    Some(if scaled <= 0.0 {
+        0
+    } else if scaled >= f64::from(STAMP_COST_CAP_FP) {
+        STAMP_COST_CAP_FP
+    } else {
+        scaled as u16
+    })
+}
+
+/// Fixed-point cost of a cost upstream generation accepts: `None` for NaN and
+/// for costs outside `0..=100`, which upstream `generate_stamp` refuses.
+pub fn generation_cost_fp(cost: f64) -> Option<u16> {
+    if !(0.0..=100.0).contains(&cost) {
+        return None;
+    }
+    cost_to_fp(cost)
 }
 
 /// Protocol-defined workblock sizes, including peering for parity validation.
@@ -155,27 +182,16 @@ impl StampSearch {
     /// `seed` must be 32 fresh bytes from the caller's cryptographic RNG. The
     /// search visits distinct successive 256-bit nonces from that random start.
     /// Material is the message ID (recipient stamp) or transient ID (PN stamp).
-    /// `cost` is an integer cost; integer costs above 100 cannot be generated,
-    /// as upstream rejects them, so such a search is exhausted at once.
+    /// `None` where upstream refuses the cost: NaN or outside `0..=100`.
     pub fn new(
         material: [u8; 32],
         kind: StampKind,
-        cost: u8,
+        cost: f64,
         seed: [u8; 32],
         attempt_limit: u64,
-    ) -> Self {
-        let cost_fp = u16::from(cost) << 8;
-        if cost_fp > STAMP_COST_CAP_FP {
-            let target = target_from_fp(STAMP_COST_CAP_FP).expect("the cap is in range");
-            return Self::build(material, kind, target, seed, 0);
-        }
-        Self::build(
-            material,
-            kind,
-            target_from_fp(cost_fp).expect("checked against the cap"),
-            seed,
-            attempt_limit,
-        )
+    ) -> Option<Self> {
+        let target = target_from_fp(generation_cost_fp(cost)?).ok()?;
+        Some(Self::build(material, kind, target, seed, attempt_limit))
     }
 
     /// Like [`Self::new`] with a fixed-point cost; above 25600 is an error.

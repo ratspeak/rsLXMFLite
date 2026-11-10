@@ -142,10 +142,12 @@ pub struct NodeAnnounce<'a> {
     /// not fit a 32-bit device.
     pub transfer_limit_kb: u64,
     pub sync_limit_kb: u64,
-    /// Integer costs, clamped to `0..=255`; fractional slot 7 costs are not read.
-    pub stamp_cost: u8,
-    pub stamp_flex: u8,
-    pub peering_cost: u8,
+    /// Costs as the upstream announce handler takes them: the fractional
+    /// slot 7 when present, else `int()` of slot 5. Values are not clamped;
+    /// use [`node_outbound_stamp_cost_fp`] for the cost a stamp must meet.
+    pub stamp_cost: f64,
+    pub stamp_flex: f64,
+    pub peering_cost: f64,
     /// Advertised name as [`node_announce_name`] returns it.
     pub name: Option<&'a str>,
 }
@@ -265,13 +267,26 @@ pub fn node_announce_name(data: &[u8]) -> Option<&str> {
 /// Parse node app data that [`node_announce_is_valid`] accepts, after the
 /// caller authenticates and binds the announce. Values are extracted with
 /// Python `int()` as the upstream announce handler does, and `None` is
-/// returned where that conversion raises. Bytes after the array are ignored.
+/// returned where that conversion raises; a non-finite slot 7 cost is refused.
+/// Bytes after the array are ignored.
 pub fn parse_node_announce(data: &[u8]) -> Option<NodeAnnounce<'_>> {
     let value = valid_node_announce(data)?;
     let int_at = |i| pyvalue::int(pyvalue::index(data, value, i)?);
     let limit = |raw: i128| raw.clamp(0, i128::from(u64::MAX)) as u64;
-    let costs = pyvalue::index(data, value, 5)?;
-    let cost = |i| Some(pyvalue::int(pyvalue::index(data, costs, i)?)?.clamp(0, 255) as u8);
+    let ceil_costs = pyvalue::index(data, value, 5)?;
+    for i in 0..3 {
+        pyvalue::int(pyvalue::index(data, ceil_costs, i)?)?;
+    }
+    let fractional = pyvalue::len(data, value)? > 7;
+    let costs = pyvalue::index(data, value, if fractional { 7 } else { 5 })?;
+    let cost = |i| {
+        let item = pyvalue::index(data, costs, i)?;
+        if fractional {
+            pyvalue::float(item).filter(|c| c.is_finite())
+        } else {
+            pyvalue::int(item).map(|c| c as f64)
+        }
+    };
     Some(NodeAnnounce {
         timebase: int_at(1)?.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64,
         enabled: pyvalue::bool_state(pyvalue::index(data, value, 2)?)?,
@@ -282,6 +297,24 @@ pub fn parse_node_announce(data: &[u8]) -> Option<NodeAnnounce<'_>> {
         peering_cost: cost(2)?,
         name: node_announce_name(data),
     })
+}
+
+/// The fixed-point propagation stamp cost a client must meet for a node, as
+/// upstream `LXMRouter.get_outbound_propagation_cost` derives it from cached
+/// app data: slot 7's first cost when present, else slot 5's, used only when
+/// it is an integer or float (not a bool), clamped to `0..=100`. `None` where
+/// upstream has no cost.
+pub fn node_outbound_stamp_cost_fp(data: &[u8]) -> Option<u16> {
+    let value = valid_node_announce(data)?;
+    let slot = if pyvalue::len(data, value)? > 7 { 7 } else { 5 };
+    let cost = match pyvalue::index(data, pyvalue::index(data, value, slot)?, 0)? {
+        Head::Int(n) => n as f64,
+        // Python's max(0, min(nan, 100)) is 0.
+        Head::Float(f) if f.is_nan() => 0.0,
+        Head::Float(f) => f,
+        _ => return None,
+    };
+    crate::stamp::cost_to_fp(cost.clamp(0.0, 100.0))
 }
 
 /// First byte of the MessagePack delivery-announce format (fixarray or
@@ -332,13 +365,16 @@ pub fn display_name<'o>(data: &[u8], out: &'o mut [u8]) -> Result<Option<&'o str
 }
 
 /// Python `stamp_cost_from_app_data` for delivery announces, as the trusted
-/// helper returns it: element 3 when it is an integer, else element 1.
+/// `announced_stamp_cost` returns it: element 3 when it is an integer or
+/// float, else element 1, where a bool counts as 0 or 1.
 ///
 /// `Some(None)` is where the upstream handler records no cost: a nil cost,
 /// empty or original-format data, or a list shorter than two. `None` means
-/// unknown: undecodable data, or a cost that is not an integer in `0..=255`
-/// (fractional costs are not read). Never interpret `None` as free delivery.
-pub fn delivery_stamp_cost(data: &[u8]) -> Option<Option<u8>> {
+/// unknown: undecodable data or a cost that is not a number, where upstream
+/// keeps the previous cost. Values are returned unclamped, including negative
+/// costs and costs above 100, which [`crate::stamp::StampSearch::new`] refuses.
+/// Never interpret `None` as free delivery.
+pub fn delivery_stamp_cost(data: &[u8]) -> Option<Option<f64>> {
     let Some(&first) = data.first() else {
         return Some(None);
     };
@@ -346,20 +382,86 @@ pub fn delivery_stamp_cost(data: &[u8]) -> Option<Option<u8>> {
         return Some(None);
     }
     let list = decode_python(data)?;
-    let length = pyvalue::len(data, list)?;
-    if length < 2 {
+    let Head::Array { count, .. } = list else {
+        return Some(None);
+    };
+    if count < 2 {
         return Some(None);
     }
-    let cost = match pyvalue::index(data, list, 3) {
-        Some(Head::Int(n)) => Head::Int(n),
-        _ => pyvalue::index(data, list, 1)?,
-    };
-    match cost {
-        Head::Nil => Some(None),
-        Head::Int(n) => Some(Some(u8::try_from(n).ok()?)),
-        // Integral floats only (`no_std` has no `fract`); NaN and infinities fail.
-        Head::Float(f) if (f as i64) as f64 == f => Some(Some(u8::try_from(f as i64).ok()?)),
+    let number = |value| match value {
+        Head::Int(n) => Some(n as f64),
+        Head::Float(f) => Some(f),
         _ => None,
+    };
+    if let Some(cost) = pyvalue::index(data, list, 3).and_then(number) {
+        return Some(Some(cost));
+    }
+    match pyvalue::index(data, list, 1)? {
+        Head::Nil => Some(None),
+        Head::Bool(b) => Some(Some(f64::from(u8::from(b)))),
+        other => number(other).map(Some),
+    }
+}
+
+/// Encode delivery announce app data as upstream `LXMRouter.get_announce_app_data`:
+/// `[name, ceil(cost), [SF_COMPRESSION], cost]`, where `cost` is the cost on
+/// the 1/256 grid when it lies in `(0, 100)` and nil otherwise. The name is
+/// written unchanged as binary. Returns the length written to `out`.
+pub fn delivery_announce_app_data(
+    display_name: Option<&str>,
+    stamp_cost: Option<f64>,
+    out: &mut [u8],
+) -> Result<usize, LxmfError> {
+    let cost_fp = stamp_cost
+        .filter(|cost| *cost > 0.0 && *cost < 100.0)
+        .and_then(crate::stamp::cost_to_fp);
+    let mut writer = SliceWriter { out, len: 0 };
+    writer.put(&[0x94])?;
+    match display_name {
+        None => writer.put(&[0xc0])?,
+        Some(name) => {
+            let length = name.len();
+            if length <= usize::from(u8::MAX) {
+                writer.put(&[0xc4, length as u8])?;
+            } else {
+                let length = u16::try_from(length).map_err(|_| LxmfError::TooLong)?;
+                writer.put(&[0xc5])?;
+                writer.put(&length.to_be_bytes())?;
+            }
+            writer.put(name.as_bytes())?;
+        }
+    }
+    match cost_fp {
+        // ceil(cost) of a cost on the grid; at most 100, a positive fixint.
+        Some(fp) if fp != 0 => writer.put(&[fp.div_ceil(256) as u8])?,
+        _ => writer.put(&[0xc0])?,
+    }
+    // [SF_COMPRESSION]
+    writer.put(&[0x91, 0x00])?;
+    match cost_fp {
+        Some(fp) => {
+            writer.put(&[0xcb])?;
+            writer.put(&(f64::from(fp) / 256.0).to_be_bytes())?;
+        }
+        None => writer.put(&[0xc0])?,
+    }
+    Ok(writer.len)
+}
+
+struct SliceWriter<'a> {
+    out: &'a mut [u8],
+    len: usize,
+}
+
+impl SliceWriter<'_> {
+    fn put(&mut self, bytes: &[u8]) -> Result<(), LxmfError> {
+        let end = self.len + bytes.len();
+        self.out
+            .get_mut(self.len..end)
+            .ok_or(LxmfError::OutputTooSmall)?
+            .copy_from_slice(bytes);
+        self.len = end;
+        Ok(())
     }
 }
 

@@ -161,6 +161,18 @@ pub(crate) fn int(value: Head<'_>) -> Option<i128> {
     }
 }
 
+/// Python `float(value)`; `None` where Python raises. Text that needs Unicode
+/// digit or underscore normalization is parsed only up to 64 normalized bytes.
+pub(crate) fn float(value: Head<'_>) -> Option<f64> {
+    match value {
+        Head::Int(n) => Some(n as f64),
+        Head::Bool(b) => Some(f64::from(u8::from(b))),
+        Head::Float(f) => Some(f),
+        Head::Str(_) | Head::Bin(_) => float_text(value),
+        _ => None,
+    }
+}
+
 /// Whether Python `float(value)` succeeds.
 pub(crate) fn float_ok(value: Head<'_>) -> bool {
     match value {
@@ -198,6 +210,84 @@ fn float_text_ok(value: Head<'_>) -> Option<()> {
         digit_run(digits, unicode, |_| {})?;
     }
     Some(())
+}
+
+/// Normalized ASCII float text, for `str::parse`.
+struct FloatText {
+    bytes: [u8; 64],
+    len: usize,
+}
+
+impl FloatText {
+    fn push(&mut self, byte: u8) -> Option<()> {
+        *self.bytes.get_mut(self.len)? = byte;
+        self.len += 1;
+        Some(())
+    }
+
+    fn digits(&mut self, part: &str, unicode: bool) -> Option<()> {
+        if part.is_empty() {
+            return Some(());
+        }
+        let mut fits = true;
+        digit_run(part, unicode, |d| {
+            fits &= self.push(b'0' + d as u8).is_some()
+        })?;
+        fits.then_some(())
+    }
+}
+
+fn float_text(value: Head<'_>) -> Option<f64> {
+    float_text_ok(value)?;
+    let (text, unicode) = numeric_text(value)?;
+    let body = text.strip_prefix(['+', '-']).unwrap_or(text);
+    let negative = text.starts_with('-');
+    if body.eq_ignore_ascii_case("inf") || body.eq_ignore_ascii_case("infinity") {
+        return Some(if negative {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        });
+    }
+    if body.eq_ignore_ascii_case("nan") {
+        return Some(f64::NAN);
+    }
+    // Validated plain ASCII is already a Rust float literal.
+    if text.is_ascii() && !text.contains('_') {
+        return text.parse().ok();
+    }
+    let (mantissa, exponent) = match body.find(['e', 'E']) {
+        Some(at) => (&body[..at], Some(&body[at + 1..])),
+        None => (body, None),
+    };
+    let (whole, fraction) = match mantissa.split_once('.') {
+        Some((w, f)) => (w, Some(f)),
+        None => (mantissa, None),
+    };
+    let mut out = FloatText {
+        bytes: [0; 64],
+        len: 0,
+    };
+    if negative {
+        out.push(b'-')?;
+    }
+    out.digits(whole, unicode)?;
+    if let Some(fraction) = fraction {
+        out.push(b'.')?;
+        out.digits(fraction, unicode)?;
+    }
+    if let Some(exponent) = exponent {
+        out.push(b'e')?;
+        let digits = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+        if exponent.starts_with('-') {
+            out.push(b'-')?;
+        }
+        out.digits(digits, unicode)?;
+    }
+    core::str::from_utf8(&out.bytes[..out.len])
+        .ok()?
+        .parse()
+        .ok()
 }
 
 /// `Some(state)` when Python's `value == True` or `value == False` holds.

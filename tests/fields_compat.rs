@@ -324,8 +324,8 @@ fn ticket_and_pow_stamps_match_trusted_finalization() {
     append_recipient_stamp(&mut packed, n, &stamp).unwrap();
     assert_eq!(packed, reference.pack().unwrap());
     let unpacked = LxMessage::unpack(&packed).unwrap();
-    assert!(unpacked.validate_stamp_with_tickets(16, Some(&[ticket.to_vec()])));
-    assert!(!unpacked.validate_stamp_with_tickets(16, Some(&[[0; 16].to_vec()])));
+    assert!(unpacked.validate_stamp_with_tickets(16.0, Some(&[ticket.to_vec()])));
+    assert!(!unpacked.validate_stamp_with_tickets(16.0, Some(&[[0; 16].to_vec()])));
 
     // Stamped opportunistic: the signed region and message ID are unchanged.
     let packed_len = packed.len();
@@ -355,7 +355,7 @@ fn ticket_and_pow_stamps_match_trusted_finalization() {
     assert_eq!(view.message_id, id);
 
     // A resumable-search stamp is accepted by trusted validation and finalization.
-    let mut search = StampSearch::new(id, StampKind::Message, 8, [0x24; 32], 1 << 20);
+    let mut search = StampSearch::new(id, StampKind::Message, 8.0, [0x24; 32], 1 << 20).unwrap();
     let pow = loop {
         match search.step(u16::MAX, u32::MAX) {
             Progress::Complete { stamp, .. } => break stamp,
@@ -374,7 +374,7 @@ fn ticket_and_pow_stamps_match_trusted_finalization() {
         .unwrap();
     assert_eq!(packed, reference.pack().unwrap());
     let unpacked = LxMessage::unpack(&packed).unwrap();
-    assert!(unpacked.validated_stamp_value(8, None).unwrap() >= 8);
+    assert!(unpacked.validated_stamp_value(8.0, None).unwrap() >= 8.0);
 }
 
 #[test]
