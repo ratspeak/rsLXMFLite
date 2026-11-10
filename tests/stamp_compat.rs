@@ -24,7 +24,12 @@ fn streamed_prefix_matches_trusted_workblock_all_kinds_and_boundaries() {
             let stamp = [nonce; 32];
             assert_eq!(
                 workblock.value(&stamp),
-                Some(lxmf_core::stamper::stamp_value(&reference, &stamp))
+                Some(rns_identity::stamps::stamp_value_fp(&reference, &stamp))
+            );
+            assert_eq!(
+                workblock.valid(&stamp, 0),
+                Some(true),
+                "cost 0 always passes"
             );
         }
     }
@@ -42,7 +47,7 @@ fn resumable_search_emits_trusted_valid_stamp_with_identical_scheduling_results(
             match search.step(0, slice) {
                 Progress::Searching { .. } => continue,
                 Progress::Complete { stamp, value } => {
-                    assert!(value >= 8);
+                    assert!(value >= 8 * 256);
                     assert!(lxmf_core::stamper::validate_stamp(
                         &MATERIAL, &stamp, 8, 1000
                     ));
@@ -57,17 +62,26 @@ fn resumable_search_emits_trusted_valid_stamp_with_identical_scheduling_results(
 
 #[test]
 fn zero_cost_zero_budgets_exhaustion_and_terminal_states() {
-    let mut zero = StampSearch::new(MATERIAL, StampKind::Message, 0, [7; 32], 0);
-    let complete = Progress::Complete {
-        stamp: [0; 32],
-        value: 0,
-    };
-    assert_eq!(zero.step(0, 0), complete);
+    // Cost zero accepts the first candidate with its real value, as upstream does.
+    let mut zero = StampSearch::new(MATERIAL, StampKind::Peering, 0, [7; 32], 1);
+    assert_eq!(zero.step(25, 0), Progress::Searching { attempts: 0 });
+    let complete = zero.step(0, 1);
+    let reference = lxmf_core::stamper::stamp_workblock(&MATERIAL, 25);
+    assert_eq!(
+        complete,
+        Progress::Complete {
+            stamp: [7; 32],
+            value: rns_identity::stamps::stamp_value_fp(&reference, &[7; 32]),
+        }
+    );
     zero.cancel();
     assert_eq!(zero.step(u16::MAX, u32::MAX), complete);
+    // Integer costs above 100 cannot be generated upstream.
+    let mut above_cap = StampSearch::new(MATERIAL, StampKind::Peering, 101, [7; 32], 99);
+    assert_eq!(above_cap.step(u16::MAX, u32::MAX), Progress::Exhausted);
     let mut empty = StampSearch::new(MATERIAL, StampKind::Propagation, 16, [7; 32], 0);
     assert_eq!(empty.step(u16::MAX, u32::MAX), Progress::Exhausted);
-    let mut hard = StampSearch::new(MATERIAL, StampKind::Peering, 255, [0xff; 32], 3);
+    let mut hard = StampSearch::new(MATERIAL, StampKind::Peering, 100, [0xff; 32], 3);
     let start = hard.progress();
     assert_eq!(hard.step(0, 999), start);
     assert_eq!(hard.step(25, 999), Progress::Searching { attempts: 0 });
@@ -82,7 +96,7 @@ fn zero_cost_zero_budgets_exhaustion_and_terminal_states() {
 #[test]
 fn cancellation_stops_both_preparation_and_search() {
     for prepare in [0, 1, 999, 1000] {
-        let mut search = StampSearch::new(MATERIAL, StampKind::Propagation, 255, [7; 32], 99);
+        let mut search = StampSearch::new(MATERIAL, StampKind::Propagation, 100, [7; 32], 99);
         search.step(prepare, 0);
         search.cancel();
         assert_eq!(search.step(u16::MAX, u32::MAX), Progress::Cancelled);

@@ -5,8 +5,15 @@
 //! state, preserving its byte count and the exact `SHA256(workblock || stamp)`.
 //! The caller owns scheduling, wall-clock limits and entropy; no call searches
 //! indefinitely or allocates. Work budgets are operation counts, not durations.
+//!
+//! Values and costs are fixed point with 8 fractional bits (1.0 is 256), using
+//! the `rns_lite_core::stamps` primitives.
 
 use hkdf::Hkdf;
+use rns_lite_core::stamps::{
+    STAMP_COST_CAP_FP, StampError, StampTarget, stamp_hash, stamp_value_fp_from_hash,
+    target_from_fp,
+};
 use sha2::{Digest, Sha256};
 
 /// Ticket length in bytes; also the length of a ticket stamp.
@@ -89,21 +96,21 @@ impl Workblock {
         self.ready()
     }
 
-    /// Leading zero bits of the exact protocol hash, once preparation completes.
+    fn hash(&self, stamp: &[u8; 32]) -> Option<[u8; 32]> {
+        self.ready().then(|| stamp_hash(&self.prefix, stamp))
+    }
+
+    /// Fixed-point stamp value (`0..=65536`, 256 per unit of cost), once
+    /// preparation completes.
     pub fn value(&self, stamp: &[u8; 32]) -> Option<u32> {
-        if !self.ready() {
-            return None;
-        }
-        let mut digest = self.prefix.clone();
-        digest.update(stamp);
-        let mut value = 0;
-        for byte in digest.finalize() {
-            value += byte.leading_zeros();
-            if byte != 0 {
-                break;
-            }
-        }
-        Some(value)
+        self.hash(stamp).map(|hash| stamp_value_fp_from_hash(&hash))
+    }
+
+    /// Whether `stamp` meets a fixed-point cost, once preparation completes.
+    /// Costs above 25600 (cost 100) are checked as 25600, and 0 always passes.
+    pub fn valid(&self, stamp: &[u8; 32], cost_fp: u16) -> Option<bool> {
+        let target = target_from_fp(cost_fp.min(STAMP_COST_CAP_FP)).expect("clamped to the cap");
+        self.hash(stamp).map(|hash| target.accepts(&hash))
     }
 }
 
@@ -122,6 +129,7 @@ fn pack_round(round: u16, out: &mut [u8; 3]) -> usize {
     }
 }
 
+/// In `Complete`, `value` is the stamp's real fixed-point value, not the cost.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Progress {
     Preparing { completed: u16, total: u16 },
@@ -137,7 +145,7 @@ pub enum Progress {
 pub struct StampSearch {
     workblock: Workblock,
     nonce: [u8; 32],
-    cost: u8,
+    target: StampTarget,
     attempts: u64,
     limit: u64,
     progress: Progress,
@@ -147,8 +155,8 @@ impl StampSearch {
     /// `seed` must be 32 fresh bytes from the caller's cryptographic RNG. The
     /// search visits distinct successive 256-bit nonces from that random start.
     /// Material is the message ID (recipient stamp) or transient ID (PN stamp).
-    /// Cost zero completes immediately with an all-zero stamp and reported value
-    /// zero, without preparing or hashing a workblock. The seed is unused then.
+    /// `cost` is an integer cost; integer costs above 100 cannot be generated,
+    /// as upstream rejects them, so such a search is exhausted at once.
     pub fn new(
         material: [u8; 32],
         kind: StampKind,
@@ -156,18 +164,53 @@ impl StampSearch {
         seed: [u8; 32],
         attempt_limit: u64,
     ) -> Self {
+        let cost_fp = u16::from(cost) << 8;
+        if cost_fp > STAMP_COST_CAP_FP {
+            let target = target_from_fp(STAMP_COST_CAP_FP).expect("the cap is in range");
+            return Self::build(material, kind, target, seed, 0);
+        }
+        Self::build(
+            material,
+            kind,
+            target_from_fp(cost_fp).expect("checked against the cap"),
+            seed,
+            attempt_limit,
+        )
+    }
+
+    /// Like [`Self::new`] with a fixed-point cost; above 25600 is an error.
+    /// Cost zero still prepares the workblock and completes with the seed and
+    /// its real value.
+    pub fn new_fp(
+        material: [u8; 32],
+        kind: StampKind,
+        cost_fp: u16,
+        seed: [u8; 32],
+        attempt_limit: u64,
+    ) -> Result<Self, StampError> {
+        Ok(Self::build(
+            material,
+            kind,
+            target_from_fp(cost_fp)?,
+            seed,
+            attempt_limit,
+        ))
+    }
+
+    fn build(
+        material: [u8; 32],
+        kind: StampKind,
+        target: StampTarget,
+        seed: [u8; 32],
+        attempt_limit: u64,
+    ) -> Self {
         Self {
             workblock: Workblock::new(material, kind),
             nonce: seed,
-            cost,
+            target,
             attempts: 0,
             limit: attempt_limit,
-            progress: if cost == 0 {
-                Progress::Complete {
-                    stamp: [0; 32],
-                    value: 0,
-                }
-            } else if attempt_limit == 0 {
+            progress: if attempt_limit == 0 {
                 Progress::Exhausted
             } else {
                 Progress::Preparing {
@@ -214,12 +257,12 @@ impl StampSearch {
             }
             Progress::Searching { .. } => {
                 for _ in 0..u64::from(attempt_budget).min(self.limit - self.attempts) {
-                    let value = self.workblock.value(&self.nonce).expect("prepared prefix");
+                    let hash = self.workblock.hash(&self.nonce).expect("prepared prefix");
                     self.attempts += 1;
-                    if value >= u32::from(self.cost) {
+                    if self.target.accepts(&hash) {
                         self.progress = Progress::Complete {
                             stamp: self.nonce,
-                            value,
+                            value: stamp_value_fp_from_hash(&hash),
                         };
                         return self.progress;
                     }
