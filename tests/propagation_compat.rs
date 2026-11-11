@@ -52,7 +52,10 @@ fn hostile_announce_fields_match_trusted_coercions() {
         if let (Some(ours), Some(trusted)) = (ours, trusted) {
             assert_eq!(ours.timebase, trusted.timebase);
             assert_eq!(ours.enabled, trusted.node_state);
-            assert_eq!(ours.transfer_limit_kb, trusted.transfer_limit);
+            assert_eq!(
+                ours.transfer_limit_kb,
+                trusted.transfer_limit.as_f64() as u64
+            );
             assert_eq!(ours.stamp_cost, trusted.stamp_cost);
         }
     };
