@@ -111,7 +111,7 @@ fn exact_size_and_direct_wire_match_trusted_encoder() {
     }
 }
 
-// The single-frame capacity is LXMF's opportunistic limit (LXMessage.py:64-79): content the
+// The single-frame capacity is LXMF's opportunistic limit (LXMessage.py): content the
 // trusted router keeps opportunistic fits one packet, and one byte more falls back to direct.
 #[test]
 fn single_frame_capacity_is_the_trusted_opportunistic_limit() {
