@@ -30,11 +30,13 @@ hkdf = { version = "0.12", default-features = false }
 
 [dev-dependencies]
 # Trusted full-Rust cross-checks (host-only): byte-exact codec parity vs lxmf-core and
-# ECIES interop vs rns-identity. Never on the MCU build path.
-lxmf-core = { path = "../rsLXMF/crates/lxmf-core", version = "~1.4.0" }
-rns-identity = { path = "../rsReticulum/crates/rns-identity", version = "~1.4.0" }
-rns-crypto = { path = "../rsReticulum/crates/rns-crypto", version = "~1.4.0" }
-rns-link = { path = "../rsReticulum/crates/rns-link", version = "~1.4.0" }
+# ECIES interop vs rns-identity. Never on the MCU build path. lxmf-core's default
+# feature is its SQLite state store, which the codec cross-checks never open, so it
+# stays off and the test build needs no C compiler.
+lxmf-core = { path = "../rsLXMF/crates/lxmf-core", version = "~1.5.0", default-features = false }
+rns-identity = { path = "../rsReticulum/crates/rns-identity", version = "~1.5.0" }
+rns-crypto = { path = "../rsReticulum/crates/rns-crypto", version = "~1.5.0" }
+rns-link = { path = "../rsReticulum/crates/rns-link", version = "~1.5.0" }
 rmpv = "1"
 # Reads the upstream-generated JSON fixtures.
 serde_json = "1"
