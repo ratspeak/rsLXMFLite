@@ -8,6 +8,10 @@
 //!
 //! Values and costs are fixed point with 8 fractional bits (1.0 is 256), using
 //! the `rns_lite_core::stamps` primitives.
+//!
+//! Received stamps are valid over the non-expanded workblock (the material
+//! itself) or the expanded one; generation stays expanded, the only form
+//! older receivers accept.
 
 use hkdf::Hkdf;
 use rns_lite_core::stamps::{
@@ -78,7 +82,8 @@ impl StampKind {
     }
 }
 
-/// Incrementally constructed prefix, also usable for validating received stamps.
+/// Incrementally constructed expanded workblock. Received LXMF stamps are
+/// judged by [`Self::validated_value`], which also tries the non-expanded form.
 pub struct Workblock {
     material: [u8; 32],
     prefix: Sha256,
@@ -133,12 +138,44 @@ impl Workblock {
         self.hash(stamp).map(|hash| stamp_value_fp_from_hash(&hash))
     }
 
-    /// Whether `stamp` meets a fixed-point cost, once preparation completes.
-    /// Costs above 25600 (cost 100) are checked as 25600, and 0 always passes.
+    /// Whether `stamp` meets a fixed-point cost over this expanded workblock
+    /// alone, once preparation completes. Costs above 25600 (cost 100) are
+    /// checked as 25600, and 0 always passes.
     pub fn valid(&self, stamp: &[u8; 32], cost_fp: u16) -> Option<bool> {
-        let target = target_from_fp(cost_fp.min(STAMP_COST_CAP_FP)).expect("clamped to the cap");
-        self.hash(stamp).map(|hash| target.accepts(&hash))
+        self.hash(stamp)
+            .map(|hash| capped_target(cost_fp).accepts(&hash))
     }
+
+    /// The value of a received stamp that meets `cost_fp` in either workblock
+    /// form, taken from the form that passed: the non-expanded form first,
+    /// then this expanded one. `None` while preparing unless the
+    /// non-expanded form passes; `Some(None)` when neither form passes.
+    pub fn validated_value(&self, stamp: &[u8; 32], cost_fp: u16) -> Option<Option<u32>> {
+        if let Some(value) = non_expanded_value(&self.material, stamp, cost_fp) {
+            return Some(Some(value));
+        }
+        let hash = self.hash(stamp)?;
+        Some(
+            capped_target(cost_fp)
+                .accepts(&hash)
+                .then(|| stamp_value_fp_from_hash(&hash)),
+        )
+    }
+}
+
+/// The value of `stamp` when it meets `cost_fp` over the non-expanded
+/// workblock, the material itself, which receivers accept besides the
+/// expanded form. Needs no preparation, so a host can try it before
+/// preparing a [`Workblock`]. Costs are capped as in [`Workblock::valid`].
+pub fn non_expanded_value(material: &[u8; 32], stamp: &[u8; 32], cost_fp: u16) -> Option<u32> {
+    let hash = stamp_hash(&Sha256::new().chain_update(material), stamp);
+    capped_target(cost_fp)
+        .accepts(&hash)
+        .then(|| stamp_value_fp_from_hash(&hash))
+}
+
+fn capped_target(cost_fp: u16) -> StampTarget {
+    target_from_fp(cost_fp.min(STAMP_COST_CAP_FP)).expect("clamped to the cap")
 }
 
 // All protocol round counts fit u16. Canonical MessagePack unsigned integers.
